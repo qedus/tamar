@@ -2,6 +2,12 @@
 name = "tamar"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+keywords = ["streaming", "flink", "spark", "async"]
+description = "A super fast stream processing framework that somewhat mirrors Apache Flink's streaming primitives and is designed for simplicity."
+homepage = "https://github.com/qedus/tamar"
+repository = "https://github.com/qedus/tamar"
+readme = "README.md"
 
 [dependencies]
 futures = "0.3.25"
