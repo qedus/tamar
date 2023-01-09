@@ -3,7 +3,7 @@ use futures::{future::BoxFuture, Future};
 use std::{
     cell::RefCell,
     cmp::PartialEq,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     hash::Hash,
     rc::Rc,
@@ -14,7 +14,7 @@ use tokio::{
     task::JoinSet,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Event<V> {
     pub processing_date_time: NaiveDateTime,
     pub event_date_time: Option<NaiveDateTime>,
@@ -121,13 +121,12 @@ where
 {
     pub fn add_sink<S>(self, sink: S)
     where
-        S: Sink<V> + Send + 'static,
+        S: Sink<V> + 'static,
     {
-        self.nodes.borrow_mut().spawn(async move {
-            let receiver = self.receiver;
-
-            sink.run(Receiver { receiver }).await;
-        });
+        let receiver = Receiver {
+            receiver: self.receiver,
+        };
+        self.nodes.borrow_mut().spawn(sink.run(receiver));
     }
 
     pub fn map<O, FN, F>(self, map: FN) -> DataStream<O>
@@ -173,12 +172,8 @@ where
         FN: Fn(Event<V>, Sender<O>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
-        let process = Arc::new(process);
         self.process_state(
-            move |event, _, sender: Sender<O>| {
-                let process = Arc::clone(&process);
-                async move { process(event, sender).await }
-            },
+            move |event, _, sender: Sender<O>| process(event, sender),
             (),
         )
     }
@@ -186,21 +181,19 @@ where
     pub fn process_state<O, FN, F, GST>(self, process: FN, global_state: GST) -> DataStream<O>
     where
         O: Send + 'static,
-        FN: Fn(Event<V>, Arc<Mutex<GST>>, Sender<O>) -> F + Send + Sync + 'static,
+        FN: Fn(Event<V>, GST, Sender<O>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
-        GST: Send + Sync + 'static,
+        GST: Clone + Send + Sync + 'static,
     {
         let (sender, receiver) = channel::<Event<O>>(1);
 
         self.nodes.borrow_mut().spawn(async move {
-            let global_state = Arc::new(Mutex::new(global_state));
             let mut receiver = self.receiver;
             while let Some(event) = receiver.recv().await {
                 let sender = Sender {
                     sender: sender.clone(),
                 };
-                let global_state = Arc::clone(&global_state);
-                process(event, global_state, sender).await;
+                process(event, global_state.clone(), sender).await;
             }
         });
 
@@ -289,12 +282,8 @@ where
         FN: Fn(K, Event<V>, Sender<O>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
-        let process = Arc::new(process);
         self.process_state(
-            move |key, event, _, _, sender: Sender<O>| {
-                let process = Arc::clone(&process);
-                async move { process(key, event, sender).await }
-            },
+            move |key, event, _, _, sender: Sender<O>| process(key, event, sender),
             (),
             |_| (),
         )
@@ -304,39 +293,33 @@ where
         self,
         process: FN,
         global_state: GST,
-        key_state: KSTF,
+        key_state_fn: KSTF,
     ) -> DataStream<O>
     where
         O: Send + 'static,
-        FN: Fn(K, Event<V>, Arc<Mutex<GST>>, Arc<Mutex<KST>>, Sender<O>) -> F
-            + Send
-            + Sync
-            + 'static,
+        FN: Fn(K, Event<V>, GST, KST, Sender<O>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
-        GST: Send + Sync + 'static,
-        KSTF: Fn(K) -> KST + Send + Sync + 'static,
-        KST: Send + Sync + 'static,
+        GST: Clone + Send + Sync + 'static,
+        KSTF: Fn(&K) -> KST + Send + Sync + 'static,
+        KST: Clone + Send + Sync + 'static,
     {
         let (sender, receiver) = channel::<Event<O>>(1);
 
         self.data_stream.nodes.borrow_mut().spawn(async move {
-            let global_state = Arc::new(Mutex::new(global_state));
-            let mut key_states: HashMap<K, Arc<Mutex<KST>>> = HashMap::default();
+            let mut key_states: HashMap<K, KST> = HashMap::default();
 
             let mut receiver = self.data_stream.receiver;
             let selector = self.selector;
             while let Some(event) = receiver.recv().await {
                 let key = selector(&event);
-                let global_state = Arc::clone(&global_state);
 
-                let key_state_fn_key = key.clone();
-                let key_state_fn = || Arc::new(Mutex::new(key_state(key_state_fn_key)));
-                let key_state = key_states.entry(key.clone()).or_insert_with(key_state_fn);
-                let key_state = Arc::clone(key_state);
+                let key_state = key_states
+                    .entry(key.clone())
+                    .or_insert_with_key(&key_state_fn);
                 let sender = Sender {
                     sender: sender.clone(),
                 };
-                process(key, event, global_state, key_state, sender).await;
+                process(key, event, global_state.clone(), key_state.clone(), sender).await;
             }
         });
 
@@ -358,7 +341,10 @@ where
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Window {
+    // Contains all events that are >= start_date_time.
     start_date_time: NaiveDateTime,
+
+    // Contains all events that are < end_date_time.
     end_date_time: NaiveDateTime,
 }
 
@@ -380,7 +366,7 @@ pub trait WindowAssigner<V> {
 }
 
 pub trait WindowMerger {
-    fn merge(&self, windows: &mut [Window]) -> Box<[(Window, Box<[Window]>)]>;
+    fn merge(&self, windows: &mut [Window]) -> Box<[(Box<[Window]>, Window)]>;
 }
 
 pub struct EventTimeSessionWindowProcessor {
@@ -403,29 +389,29 @@ impl<V> WindowAssigner<V> for EventTimeSessionWindowProcessor {
 }
 
 impl WindowMerger for EventTimeSessionWindowProcessor {
-    fn merge(&self, windows: &mut [Window]) -> Box<[(Window, Box<[Window]>)]> {
+    fn merge(&self, windows: &mut [Window]) -> Box<[(Box<[Window]>, Window)]> {
         windows.sort_by(|left, right| left.start_date_time.cmp(&right.start_date_time));
 
         let mut merged = Vec::with_capacity(windows.len());
-        let mut current_merge: Option<(Window, HashSet<Window>)> = None;
+        let mut current_merge: Option<(HashSet<Window>, Window)> = None;
 
         for window in windows.iter() {
             match current_merge {
                 None => {
                     let mut merged_windows = HashSet::default();
                     merged_windows.insert(window.clone());
-                    current_merge = Some((window.clone(), merged_windows));
+                    current_merge = Some((merged_windows, window.clone()));
                 }
                 Some(ref mut merge) => {
-                    if merge.0.intersects(window) {
-                        merge.0 = merge.0.union(window);
-                        merge.1.insert(window.clone());
+                    if merge.1.intersects(window) {
+                        merge.1 = merge.1.union(window);
+                        merge.0.insert(window.clone());
                     } else {
                         let mut merged_windows = HashSet::default();
                         merged_windows.insert(window.clone());
                         merged.push(
                             current_merge
-                                .replace((window.clone(), merged_windows))
+                                .replace((merged_windows, window.clone()))
                                 .unwrap(),
                         );
                     }
@@ -439,23 +425,146 @@ impl WindowMerger for EventTimeSessionWindowProcessor {
 
         merged
             .into_iter()
-            .map(|(window, merged_windows)| {
+            .map(|(merged_windows, window)| {
                 (
-                    window,
                     merged_windows
                         .into_iter()
                         .collect::<Vec<Window>>()
                         .into_boxed_slice(),
+                    window,
                 )
             })
-            .collect::<Vec<(Window, Box<[Window]>)>>()
+            .collect::<Vec<(Box<[Window]>, Window)>>()
             .into_boxed_slice()
     }
 }
 
-struct WindowsKeyState<V, KST> {
-    window_events: HashMap<Window, Vec<Arc<Event<V>>>>,
-    key_state: Arc<Mutex<KST>>,
+#[derive(Default)]
+struct Windows<V> {
+    events: BTreeMap<NaiveDateTime, Vec<Event<V>>>,
+    start_date_time_windows: BTreeMap<NaiveDateTime, HashSet<Window>>,
+    end_date_time_windows: BTreeMap<NaiveDateTime, HashSet<Window>>,
+}
+
+impl<V> Windows<V> {
+    fn new() -> Self {
+        Self {
+            events: BTreeMap::new(),
+            start_date_time_windows: BTreeMap::new(),
+            end_date_time_windows: BTreeMap::new(),
+        }
+    }
+
+    fn add_window(&mut self, window: &Window) {
+        self.start_date_time_windows
+            .entry(window.start_date_time)
+            .or_default()
+            .insert(window.clone());
+        self.end_date_time_windows
+            .entry(window.end_date_time)
+            .or_default()
+            .insert(window.clone());
+    }
+
+    fn add_event(&mut self, event: Event<V>) {
+        let event_date_time = event.event_date_time.unwrap();
+        self.events.entry(event_date_time).or_default().push(event);
+    }
+
+    fn windows(&self) -> impl Iterator<Item = &Window> {
+        self.start_date_time_windows.values().flatten()
+    }
+
+    /// Merges from_windows to to_windows and migrates all the interanl data
+    /// appropriately.
+    fn merge<F>(&mut self, from_windows: F, to_window: Window)
+    where
+        F: IntoIterator<Item = Window>,
+    {
+        from_windows.into_iter().for_each(|from_window| {
+            // Replace old windows with new merged ones.
+            let start_windows = self
+                .start_date_time_windows
+                .get_mut(&from_window.start_date_time)
+                .unwrap();
+            start_windows.remove(&from_window);
+            if start_windows.is_empty() {
+                self.start_date_time_windows
+                    .remove(&from_window.start_date_time);
+            }
+            self.start_date_time_windows
+                .entry(to_window.start_date_time)
+                .or_default()
+                .insert(to_window.clone());
+
+            let end_windows = self
+                .end_date_time_windows
+                .get_mut(&from_window.end_date_time)
+                .unwrap();
+            end_windows.remove(&from_window);
+            if end_windows.is_empty() {
+                self.end_date_time_windows
+                    .remove(&from_window.end_date_time);
+            }
+            self.end_date_time_windows
+                .entry(to_window.end_date_time)
+                .or_default()
+                .insert(to_window.clone());
+        });
+    }
+
+    /// Return all the events for all the windows that have expired due to the
+    /// new watermark_date_time.
+    fn events<'a>(
+        &'a mut self,
+        watermark_date_time: NaiveDateTime,
+    ) -> impl Iterator<Item = (Window, Box<[Event<V>]>)> + 'a
+    where
+        V: Clone,
+    {
+        self.end_date_time_windows
+            .range(..=watermark_date_time)
+            .flat_map(|(_, windows)| windows)
+            .map(|window| {
+                // Collect the window events.
+                let events: Box<[Event<V>]> = self
+                    .events
+                    .range(window.start_date_time..window.end_date_time)
+                    .flat_map(|(_, events)| events)
+                    .cloned()
+                    .collect();
+
+                // Take the opportunity to remove expired data from the
+                // start_date_time_windows structure.
+                let start_date_time_windows = self
+                    .start_date_time_windows
+                    .get_mut(&window.start_date_time)
+                    .unwrap();
+                start_date_time_windows.remove(window);
+                if start_date_time_windows.is_empty() {
+                    self.start_date_time_windows.remove(&window.start_date_time);
+                }
+
+                (window.clone(), events)
+            })
+    }
+
+    /// Remove expired end_date_time_windows and events.
+    fn evict(&mut self, watermark_date_time: NaiveDateTime) {
+        let split_date_time = watermark_date_time + Duration::nanoseconds(1);
+
+        // Make sure we don't keep windows that have end_date_time values on
+        // watermark_date_time as they are also done.
+        self.end_date_time_windows = self.end_date_time_windows.split_off(&split_date_time);
+
+        self.events = self.events.split_off(&watermark_date_time);
+    }
+}
+
+struct WindowedDataStreamKeyState<V, KST> {
+    user_key_state: KST,
+
+    windows: Arc<Mutex<Windows<V>>>,
 }
 
 pub struct WindowedDataStream<V, KS, K, A, M>
@@ -472,7 +581,7 @@ impl<V, KS, K, A, M> WindowedDataStream<V, KS, K, A, M>
 where
     V: Clone + Send + Sync + 'static,
     KS: Fn(&Event<V>) -> K + Send + 'static,
-    K: Hash + Eq + Send + Clone + 'static,
+    K: Hash + Eq + Send + Sync + Clone + 'static,
     A: WindowAssigner<V> + Send + Sync + 'static,
     M: WindowMerger + Send + Sync + 'static,
 {
@@ -482,147 +591,107 @@ where
         FN: Fn(K, Box<[Event<V>]>, Sender<O>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
-        let process = Arc::new(process);
         self.process_state(
-            move |key, events, _, _, sender: Sender<O>| {
-                let process = Arc::clone(&process);
-                async move { process(key, events, sender).await }
-            },
+            move |key, events, _, _, sender: Sender<O>| process(key, events, sender),
             (),
             |_| (),
         )
     }
 
     async fn process_windows<O, FN, F, GST, KST>(
+        windows: Arc<Mutex<Windows<V>>>,
         assigner: Arc<A>,
         merger: Arc<M>,
         process: Arc<FN>,
         key: K,
         event: Event<V>,
-        global_state: Arc<Mutex<GST>>,
-        key_state: Arc<Mutex<WindowsKeyState<V, KST>>>,
+        global_state: GST,
+        key_state: KST,
         sender: Sender<O>,
     ) where
-        O: Send + 'static,
-        FN: Fn(K, Box<[Event<V>]>, Arc<Mutex<GST>>, Arc<Mutex<KST>>, Sender<O>) -> F
-            + Send
-            + Sync
-            + 'static,
+        FN: Fn(K, Box<[Event<V>]>, GST, KST, Sender<O>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
-        GST: Send + Sync + 'static,
-        KST: Send + Sync + 'static,
+        GST: Clone + Send + Sync + 'static,
+        KST: Clone + Send + Sync + 'static,
+        O: Send + 'static,
     {
+        let mut windows_lock = windows.lock().await;
         let watermark_date_time = event.watermark_date_time.unwrap();
-        let event = Arc::new(event);
-        let mut windows_key_state = key_state.lock().await;
 
-        for window in assigner.assign(&event).iter() {
-            windows_key_state
-                .window_events
-                .entry(window.clone())
-                .or_default()
-                .push(Arc::clone(&event));
-        }
-
-        let mut windows = windows_key_state
-            .window_events
-            .keys()
-            .cloned()
-            .collect::<Vec<Window>>()
-            .into_boxed_slice();
-
-        // Merge windows.
-        merger
-            .merge(&mut windows)
+        assigner
+            .assign(&event)
             .iter()
-            .flat_map(|(to_window, from_windows)| {
-                from_windows
-                    .iter()
-                    .map(|from_window| (to_window.clone(), from_window))
-            })
-            .for_each(|(to_window, from_window)| {
-                let mut events = windows_key_state.window_events.remove(from_window).unwrap();
-                windows_key_state
-                    .window_events
-                    .entry(to_window)
-                    .or_default()
-                    .append(&mut events);
+            .for_each(|window| windows_lock.add_window(window));
+
+        windows_lock.add_event(event);
+
+        let mut all_windows: Vec<Window> = windows_lock.windows().cloned().collect();
+
+        merger
+            .merge(&mut all_windows)
+            .to_vec()
+            .drain(..)
+            .for_each(|(from_windows, to_window)| {
+                windows_lock.merge(from_windows.to_vec().drain(..), to_window);
             });
 
-        // Merged windows.
-        let windows = windows_key_state
-            .window_events
-            .keys()
-            .cloned()
-            .collect::<Vec<Window>>()
-            .into_boxed_slice();
-
-        for window in windows.iter() {
-            if window.end_date_time >= watermark_date_time {
-                continue;
-            }
-
+        for (_, events) in windows_lock.events(watermark_date_time) {
             let key = key.clone();
-            let events = windows_key_state
-                .window_events
-                .remove(window)
-                .unwrap()
-                .into_iter()
-                .map(|event| Arc::try_unwrap(event).unwrap_or_else(|arc| (*arc).clone()))
-                .collect::<Vec<Event<V>>>()
-                .into_boxed_slice();
-
-            let global_state = Arc::clone(&global_state);
-            let key_state = Arc::clone(&windows_key_state.key_state);
+            let key_state = key_state.clone();
+            let global_state = global_state.clone();
+            let process = Arc::clone(&process);
             let sender = sender.clone();
 
             process(key, events, global_state, key_state, sender).await;
         }
+        // Remove done end_date_time_windows.
+        windows_lock.evict(watermark_date_time);
     }
 
     pub fn process_state<O, FN, F, GST, KSTF, KST>(
         self,
         process: FN,
         global_state: GST,
-        key_state: KSTF,
+        key_state_fn: KSTF,
     ) -> DataStream<O>
     where
         O: Send + 'static,
-        FN: Fn(K, Box<[Event<V>]>, Arc<Mutex<GST>>, Arc<Mutex<KST>>, Sender<O>) -> F
-            + Send
-            + Sync
-            + 'static,
+        FN: Fn(K, Box<[Event<V>]>, GST, KST, Sender<O>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
-        GST: Send + Sync + 'static,
-        KSTF: Fn(K) -> KST + Send + Sync + 'static,
-        KST: Send + Sync + 'static,
+        GST: Clone + Send + Sync + 'static,
+        KSTF: Fn(&K) -> KST + Send + Sync + 'static,
+        KST: Clone + Send + Sync + 'static,
     {
         let process = Arc::new(process);
         self.keyed_data_stream.process_state(
             move |key,
                   event,
                   global_state,
-                  key_state: Arc<Mutex<WindowsKeyState<V, KST>>>,
+                  key_state: Arc<WindowedDataStreamKeyState<V, KST>>,
                   sender| {
                 let assigner = Arc::clone(&self.assigner);
                 let merger = Arc::clone(&self.merger);
                 let process = Arc::clone(&process);
 
+                let windows = Arc::clone(&key_state.windows);
                 Self::process_windows(
+                    windows,
                     assigner,
                     merger,
                     process,
                     key,
                     event,
                     global_state,
-                    key_state,
+                    key_state.user_key_state.clone(),
                     sender,
                 )
             },
             global_state,
-            move |key| WindowsKeyState {
-                window_events: HashMap::<Window, Vec<Arc<Event<V>>>>::new(),
-                key_state: Arc::new(Mutex::new(key_state(key))),
+            move |key| {
+                Arc::new(WindowedDataStreamKeyState {
+                    user_key_state: key_state_fn(key),
+                    windows: Arc::new(Mutex::new(Windows::new())),
+                })
             },
         )
     }
@@ -650,16 +719,12 @@ impl Environment {
 
     pub fn add_source<S, V>(&self, source: S) -> DataStream<V>
     where
-        S: Source<V> + Send + Sync + 'static,
-        V: Send + 'static,
+        S: Source<V> + 'static,
     {
         let (sender, receiver) = channel::<Event<V>>(1);
 
-        let mut nodes = self.nodes.borrow_mut();
-        nodes.spawn(async move {
-            let sender = Sender { sender };
-            source.run(sender).await;
-        });
+        let sender = Sender { sender };
+        self.nodes.borrow_mut().spawn(source.run(sender));
 
         DataStream {
             nodes: Rc::clone(&self.nodes),
@@ -765,7 +830,7 @@ mod tests {
         fn run<'b>(self, mut receiver: Receiver<V>) -> BoxFuture<'b, ()> {
             let mut events = self.0.to_vec();
             Box::pin(async move {
-                let mut iter = events.drain(..).into_iter();
+                let mut iter = events.drain(..);
                 while let Some(event) = receiver.receive().await {
                     let expected = iter.next().unwrap();
                     assert_eq!(expected.processing_date_time, event.processing_date_time);
@@ -864,8 +929,8 @@ mod tests {
                     global_state.count += 1;
                     key_state.count += 1;
                 },
-                CountState { count: 0 },
-                |_key| CountState { count: 0 },
+                Arc::new(Mutex::new(CountState { count: 0 })),
+                |_key| Arc::new(Mutex::new(CountState { count: 0 })),
             )
             .add_sink(sink);
 
@@ -926,17 +991,17 @@ mod tests {
 
         let merge = merged
             .iter()
-            .find(|(to_window, _from_windows)| to_window == &windows[0])
+            .find(|(_from_windows, to_window)| to_window == &windows[0])
             .unwrap();
-        assert_eq!(1, merge.1.len());
-        assert_eq!(windows[0], merge.1[0]);
+        assert_eq!(1, merge.0.len());
+        assert_eq!(windows[0], merge.0[0]);
 
         let merge = merged
             .iter()
-            .find(|(to_window, _from_windows)| to_window == &windows[1])
+            .find(|(_from_windows, to_window)| to_window == &windows[1])
             .unwrap();
-        assert_eq!(1, merge.1.len());
-        assert_eq!(windows[1], merge.1[0]);
+        assert_eq!(1, merge.0.len());
+        assert_eq!(windows[1], merge.0[0]);
     }
 
     #[test]
@@ -956,7 +1021,7 @@ mod tests {
         let merged = processor.merge(&mut windows);
         assert_eq!(1, merged.len());
 
-        let (to_window, from_windows) = &merged[0];
+        let (from_windows, to_window) = &merged[0];
 
         assert_eq!(
             to_window,
@@ -998,7 +1063,7 @@ mod tests {
                         .await;
                     global_state.count += 1;
                 },
-                CountState { count: 0 },
+                Arc::new(Mutex::new(CountState { count: 0 })),
             )
             .add_sink(sink);
         env.execute().await;
@@ -1131,8 +1196,8 @@ mod tests {
 
                     sender.send(grouped_event).await;
                 },
-                CountState { count: 0 },
-                |_key| CountState { count: 0 },
+                Arc::new(Mutex::new(CountState { count: 0 })),
+                |_key| Arc::new(Mutex::new(CountState { count: 0 })),
             )
             .add_sink(sink);
 
@@ -1185,11 +1250,101 @@ mod tests {
 
                     sender.send(grouped_event).await;
                 },
-                CountState { count: 0 },
-                |_key| CountState { count: 0 },
+                Arc::new(Mutex::new(CountState { count: 0 })),
+                |_key| Arc::new(Mutex::new(CountState { count: 0 })),
             )
             .add_sink(sink);
 
         env.execute().await;
+    }
+
+    #[test]
+    fn multiple_window_events() {
+        let mut windows = Windows::new();
+        windows.add_window(&Window {
+            start_date_time: naive_date_time(12, 0),
+            end_date_time: naive_date_time(12, 2),
+        });
+        windows.add_window(&Window {
+            start_date_time: naive_date_time(12, 10),
+            end_date_time: naive_date_time(12, 20),
+        });
+
+        [
+            new_event(0_usize, 12, 8),
+            new_event(1_usize, 12, 10),
+            new_event(2_usize, 12, 10),
+            new_event(3_usize, 12, 12),
+        ]
+        .into_iter()
+        .for_each(|event| {
+            windows.add_event(event);
+        });
+
+        let watermark_date_time = naive_date_time(12, 9);
+
+        let mut window_events_vec = Vec::new();
+        for (window, events) in windows.events(watermark_date_time) {
+            window_events_vec.push((window, events));
+        }
+        windows.evict(watermark_date_time);
+
+        assert_eq!(1, window_events_vec.len());
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 0),
+                end_date_time: naive_date_time(12, 2),
+            },
+            window_events_vec[0].0
+        );
+        assert!(window_events_vec[0].1.is_empty());
+        assert_eq!(2, windows.events.len());
+
+        assert_eq!(
+            3,
+            windows
+                .events
+                .values()
+                .map(|events| events)
+                .flatten()
+                .count()
+        );
+        assert_eq!(1, windows.start_date_time_windows.len());
+        assert_eq!(1, windows.end_date_time_windows.len());
+
+        let watermark_date_time = naive_date_time(12, 10);
+
+        let mut window_events_vec = Vec::new();
+        for (window, events) in windows.events(watermark_date_time) {
+            window_events_vec.push((window, events));
+        }
+        windows.evict(watermark_date_time);
+
+        assert_eq!(0, window_events_vec.len());
+
+        let watermark_date_time = naive_date_time(12, 20);
+
+        let mut window_events_vec = Vec::new();
+        for (window, events) in windows.events(watermark_date_time) {
+            window_events_vec.push((window, events));
+        }
+        windows.evict(watermark_date_time);
+
+        assert_eq!(1, window_events_vec.len());
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 10),
+                end_date_time: naive_date_time(12, 20),
+            },
+            window_events_vec[0].0,
+        );
+        assert_eq!(3, window_events_vec[0].1.len());
+        assert_eq!(new_event(1_usize, 12, 10), window_events_vec[0].1[0]);
+        assert_eq!(new_event(2_usize, 12, 10), window_events_vec[0].1[1]);
+        assert_eq!(new_event(3_usize, 12, 12), window_events_vec[0].1[2]);
+
+        assert!(windows.events.is_empty());
+        assert!(windows.start_date_time_windows.is_empty());
+        assert!(windows.end_date_time_windows.is_empty());
     }
 }
