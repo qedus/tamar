@@ -484,42 +484,37 @@ impl<V> Windows<V> {
         self.start_date_time_windows.values().flatten()
     }
 
-    /// Merges from_windows to to_windows and migrates all the interanl data
+    /// Replaces from_window to to_windows and migrates all the interanl data
     /// appropriately.
-    fn merge<'a, F>(&'a mut self, from_windows: F, to_window: Window)
-    where
-        F: IntoIterator<Item = &'a Window>,
-    {
-        from_windows.into_iter().for_each(|from_window| {
-            // Replace old windows with new merged ones.
-            let start_windows = self
-                .start_date_time_windows
-                .get_mut(&from_window.start_date_time)
-                .unwrap();
-            start_windows.remove(&from_window);
-            if start_windows.is_empty() {
-                self.start_date_time_windows
-                    .remove(&from_window.start_date_time);
-            }
+    fn replace(&mut self, from_window: &Window, to_window: &Window) {
+        // Replace old windows with new merged ones.
+        let start_windows = self
+            .start_date_time_windows
+            .get_mut(&from_window.start_date_time)
+            .unwrap();
+        start_windows.remove(&from_window);
+        if start_windows.is_empty() {
             self.start_date_time_windows
-                .entry(to_window.start_date_time)
-                .or_default()
-                .insert(to_window.clone());
+                .remove(&from_window.start_date_time);
+        }
+        self.start_date_time_windows
+            .entry(to_window.start_date_time)
+            .or_default()
+            .insert(to_window.clone());
 
-            let end_windows = self
-                .end_date_time_windows
-                .get_mut(&from_window.end_date_time)
-                .unwrap();
-            end_windows.remove(&from_window);
-            if end_windows.is_empty() {
-                self.end_date_time_windows
-                    .remove(&from_window.end_date_time);
-            }
+        let end_windows = self
+            .end_date_time_windows
+            .get_mut(&from_window.end_date_time)
+            .unwrap();
+        end_windows.remove(&from_window);
+        if end_windows.is_empty() {
             self.end_date_time_windows
-                .entry(to_window.end_date_time)
-                .or_default()
-                .insert(to_window.clone());
-        });
+                .remove(&from_window.end_date_time);
+        }
+        self.end_date_time_windows
+            .entry(to_window.end_date_time)
+            .or_default()
+            .insert(to_window.clone());
     }
 
     /// Return all the events for all the windows that have expired due to the
@@ -580,7 +575,7 @@ struct WindowsProcessor<K, KS, V, A, M> {
 
 impl<K, KS, V, A, M> WindowsProcessor<K, KS, V, A, M>
 where
-    K: Eq + Hash + Clone + Copy,
+    K: Eq + Hash + Clone + 'static,
     KS: Fn(&Event<V>) -> K,
     V: Clone,
     A: WindowAssigner<V>,
@@ -590,7 +585,7 @@ where
         let key = (self.key_selector)(&event);
         let watermark_date_time = event.watermark_date_time.unwrap();
 
-        let windows = self.key_windows.entry(key).or_default();
+        let windows = self.key_windows.entry(key.clone()).or_default();
 
         self.assigner
             .assign(&event)
@@ -600,12 +595,18 @@ where
 
         self.merger
             .merge(windows.windows())
-            .to_vec()
-            .drain(..)
-            .for_each(|(from_windows, to_window)| {
-                windows.merge(from_windows.iter(), to_window);
+            .into_iter()
+            .flat_map(|(from_windows, to_window)| {
+                from_windows
+                    .into_iter()
+                    .map(move |from_window| (from_window, to_window))
+            })
+            .for_each(|(from_window, to_window)| {
+                windows.replace(from_window, to_window);
             });
 
+        // Iterate over all windows with the specified timestamp to see if any
+        // windows have expired.
         self.key_windows
             .values_mut()
             .flat_map(move |window| window.events(watermark_date_time))
@@ -678,10 +679,14 @@ where
 
         merger
             .merge(windows_lock.windows())
-            .to_vec()
-            .drain(..)
-            .for_each(|(from_windows, to_window)| {
-                windows_lock.merge(from_windows.iter(), to_window);
+            .into_iter()
+            .flat_map(|(from_windows, to_window)| {
+                from_windows
+                    .into_iter()
+                    .map(move |from_window| (from_window, to_window))
+            })
+            .for_each(|(from_window, to_window)| {
+                windows_lock.replace(from_window, to_window);
             });
 
         for (_, events) in windows_lock.events(watermark_date_time) {
