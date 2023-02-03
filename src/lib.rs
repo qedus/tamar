@@ -644,6 +644,7 @@ where
 
             process(key, events, global_state, key_state, sender).await;
         }
+
         // Remove done end_date_time_windows.
         windows_lock.evict(watermark_date_time);
     }
@@ -838,6 +839,8 @@ mod tests {
                     assert_eq!(expected.watermark_date_time, event.watermark_date_time);
                     assert_eq!(expected.value, event.value);
                 }
+
+                assert!(iter.next().is_none());
             })
         }
     }
@@ -866,12 +869,26 @@ mod tests {
                 while let Some(event) = receiver.receive().await {
                     assert_eq!(self.range.next().unwrap(), event.value);
                 }
+
+                assert!(self.range.next().is_none());
             })
         }
     }
 
     #[tokio::test]
-    async fn filter() {
+    async fn data_stream_source_to_sink() {
+        let env = Environment::default();
+
+        let source = IncrementingSource { iter: (0..5) };
+        let sink = IncrementingAssertSink::create(0..5);
+
+        env.add_source(source).add_sink(sink);
+
+        env.execute().await;
+    }
+
+    #[tokio::test]
+    async fn data_stream_filter() {
         let env = Environment::default();
 
         let source = IncrementingSource { iter: (0..10) };
@@ -889,7 +906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process() {
+    async fn data_stream_process() {
         let env = Environment::default();
 
         let source = IncrementingSource { iter: (0..10) };
@@ -1078,9 +1095,7 @@ mod tests {
 
         let sink = SliceEventAssertSink([new_event(vec![0_usize], 12, 10)].into());
 
-        let stream = env.add_source(source);
-
-        stream
+        env.add_source(source)
             .key_by(|event| event.value)
             .window(EventTimeSessionWindowProcessor::with_timeout(
                 Duration::minutes(10),
