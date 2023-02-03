@@ -362,7 +362,9 @@ impl Window {
 }
 
 pub trait WindowAssigner<V> {
-    fn assign(&self, event: &Event<V>) -> Box<[Window]>;
+    type Iterator: Iterator<Item = Window>;
+
+    fn assign(&self, event: &Event<V>) -> Self::Iterator;
 }
 
 pub trait WindowMerger {
@@ -380,11 +382,13 @@ impl EventTimeSessionWindowProcessor {
 }
 
 impl<V> WindowAssigner<V> for EventTimeSessionWindowProcessor {
-    fn assign(&self, event: &Event<V>) -> Box<[Window]> {
-        Box::new([Window {
+    type Iterator = std::iter::Once<Window>;
+
+    fn assign(&self, event: &Event<V>) -> Self::Iterator {
+        std::iter::once(Window {
             start_date_time: event.event_date_time.unwrap(),
             end_date_time: event.event_date_time.unwrap() + self.timeout,
-        }])
+        })
     }
 }
 
@@ -620,8 +624,7 @@ where
 
         assigner
             .assign(&event)
-            .iter()
-            .for_each(|window| windows_lock.add_window(window));
+            .for_each(|ref window| windows_lock.add_window(window));
 
         windows_lock.add_event(event);
 
@@ -976,7 +979,7 @@ mod tests {
         let processor = EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10));
 
         let event = new_event(0, 12, 10);
-        let windows = processor.assign(&event);
+        let windows: Box<[Window]> = processor.assign(&event).collect();
 
         assert_eq!(1, windows.len());
 
