@@ -368,7 +368,10 @@ pub trait WindowAssigner<V> {
 }
 
 pub trait WindowMerger {
-    fn merge(&self, windows: &mut [Window]) -> Box<[(Box<[Window]>, Window)]>;
+    fn merge<'a>(
+        &'a self,
+        windows: impl Iterator<Item = &'a Window>,
+    ) -> Box<[(Box<[Window]>, Window)]>;
 }
 
 pub struct EventTimeSessionWindowProcessor {
@@ -393,13 +396,14 @@ impl<V> WindowAssigner<V> for EventTimeSessionWindowProcessor {
 }
 
 impl WindowMerger for EventTimeSessionWindowProcessor {
-    fn merge(&self, windows: &mut [Window]) -> Box<[(Box<[Window]>, Window)]> {
-        windows.sort_by(|left, right| left.start_date_time.cmp(&right.start_date_time));
-
-        let mut merged = Vec::with_capacity(windows.len());
+    fn merge<'a>(
+        &'a self,
+        windows: impl Iterator<Item = &'a Window>,
+    ) -> Box<[(Box<[Window]>, Window)]> {
+        let mut merged = Vec::default();
         let mut current_merge: Option<(HashSet<Window>, Window)> = None;
 
-        for window in windows.iter() {
+        for window in windows {
             match current_merge {
                 None => {
                     let mut merged_windows = HashSet::default();
@@ -443,22 +447,23 @@ impl WindowMerger for EventTimeSessionWindowProcessor {
     }
 }
 
-#[derive(Default)]
 struct Windows<V> {
     events: BTreeMap<NaiveDateTime, Vec<Event<V>>>,
     start_date_time_windows: BTreeMap<NaiveDateTime, HashSet<Window>>,
     end_date_time_windows: BTreeMap<NaiveDateTime, HashSet<Window>>,
 }
 
-impl<V> Windows<V> {
-    fn new() -> Self {
+impl<V> Default for Windows<V> {
+    fn default() -> Self {
         Self {
-            events: BTreeMap::new(),
-            start_date_time_windows: BTreeMap::new(),
-            end_date_time_windows: BTreeMap::new(),
+            events: BTreeMap::default(),
+            start_date_time_windows: BTreeMap::default(),
+            end_date_time_windows: BTreeMap::default(),
         }
     }
+}
 
+impl<V> Windows<V> {
     fn add_window(&mut self, window: &Window) {
         self.start_date_time_windows
             .entry(window.start_date_time)
@@ -481,9 +486,9 @@ impl<V> Windows<V> {
 
     /// Merges from_windows to to_windows and migrates all the interanl data
     /// appropriately.
-    fn merge<F>(&mut self, from_windows: F, to_window: Window)
+    fn merge<'a, F>(&'a mut self, from_windows: F, to_window: Window)
     where
-        F: IntoIterator<Item = Window>,
+        F: IntoIterator<Item = &'a Window>,
     {
         from_windows.into_iter().for_each(|from_window| {
             // Replace old windows with new merged ones.
@@ -565,6 +570,49 @@ impl<V> Windows<V> {
     }
 }
 
+struct WindowsProcessor<K, KS, V, A, M> {
+    key_windows: HashMap<K, Windows<V>>,
+
+    key_selector: KS,
+    assigner: A,
+    merger: M,
+}
+
+impl<K, KS, V, A, M> WindowsProcessor<K, KS, V, A, M>
+where
+    K: Eq + Hash + Clone + Copy,
+    KS: Fn(&Event<V>) -> K,
+    V: Clone,
+    A: WindowAssigner<V>,
+    M: WindowMerger,
+{
+    fn process(&mut self, event: Event<V>) -> impl Iterator<Item = (K, Box<[Event<V>]>)> + '_ {
+        let key = (self.key_selector)(&event);
+        let watermark_date_time = event.watermark_date_time.unwrap();
+
+        let windows = self.key_windows.entry(key).or_default();
+
+        self.assigner
+            .assign(&event)
+            .for_each(|ref window| windows.add_window(window));
+
+        windows.add_event(event);
+
+        self.merger
+            .merge(windows.windows())
+            .to_vec()
+            .drain(..)
+            .for_each(|(from_windows, to_window)| {
+                windows.merge(from_windows.iter(), to_window);
+            });
+
+        self.key_windows
+            .values_mut()
+            .flat_map(move |window| window.events(watermark_date_time))
+            .map(move |(_, events)| (key.clone(), events))
+    }
+}
+
 struct WindowedDataStreamKeyState<V, KST> {
     user_key_state: KST,
 
@@ -628,14 +676,12 @@ where
 
         windows_lock.add_event(event);
 
-        let mut all_windows: Vec<Window> = windows_lock.windows().cloned().collect();
-
         merger
-            .merge(&mut all_windows)
+            .merge(windows_lock.windows())
             .to_vec()
             .drain(..)
             .for_each(|(from_windows, to_window)| {
-                windows_lock.merge(from_windows.to_vec().drain(..), to_window);
+                windows_lock.merge(from_windows.iter(), to_window);
             });
 
         for (_, events) in windows_lock.events(watermark_date_time) {
@@ -694,7 +740,7 @@ where
             move |key| {
                 Arc::new(WindowedDataStreamKeyState {
                     user_key_state: key_state_fn(key),
-                    windows: Arc::new(Mutex::new(Windows::new())),
+                    windows: Arc::new(Mutex::new(Windows::default())),
                 })
             },
         )
@@ -994,7 +1040,7 @@ mod tests {
 
     #[test]
     fn event_time_session_window_processor_merger_not_mergeable() {
-        let mut windows = [
+        let windows = [
             Window {
                 start_date_time: naive_date_time(0, 0),
                 end_date_time: naive_date_time(0, 2),
@@ -1006,7 +1052,7 @@ mod tests {
         ];
 
         let processor = EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10));
-        let merged = processor.merge(&mut windows);
+        let merged = processor.merge(windows.iter());
         assert_eq!(2, merged.len());
 
         let merge = merged
@@ -1026,7 +1072,7 @@ mod tests {
 
     #[test]
     fn event_time_session_window_processor_merger_mergeable() {
-        let mut windows = [
+        let windows = [
             Window {
                 start_date_time: naive_date_time(0, 0),
                 end_date_time: naive_date_time(0, 8),
@@ -1038,7 +1084,7 @@ mod tests {
         ];
 
         let processor = EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10));
-        let merged = processor.merge(&mut windows);
+        let merged = processor.merge(windows.iter());
         assert_eq!(1, merged.len());
 
         let (from_windows, to_window) = &merged[0];
@@ -1278,7 +1324,7 @@ mod tests {
 
     #[test]
     fn multiple_window_events() {
-        let mut windows = Windows::new();
+        let mut windows = Windows::default();
         windows.add_window(&Window {
             start_date_time: naive_date_time(12, 0),
             end_date_time: naive_date_time(12, 2),
