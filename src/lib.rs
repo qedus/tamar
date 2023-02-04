@@ -581,18 +581,25 @@ where
     A: WindowAssigner<V>,
     M: WindowMerger,
 {
-    fn process(&mut self, event: Event<V>) -> impl Iterator<Item = (K, Box<[Event<V>]>)> + '_ {
+    fn process(
+        &mut self,
+        event: Event<V>,
+    ) -> impl Iterator<Item = (K, Window, Box<[Event<V>]>)> + '_ {
         let key = (self.key_selector)(&event);
         let watermark_date_time = event.watermark_date_time.unwrap();
 
         let windows = self.key_windows.entry(key.clone()).or_default();
 
+        // Determine which windows the event is supposed to be in and add it to
+        // the windows container for that event's key.
         self.assigner
             .assign(&event)
             .for_each(|ref window| windows.add_window(window));
 
         windows.add_event(event);
 
+        // It is possible that a new window created by the event means that
+        // windows can be merged.
         self.merger
             .merge(windows.windows())
             .into_iter()
@@ -606,11 +613,12 @@ where
             });
 
         // Iterate over all windows with the specified timestamp to see if any
-        // windows have expired.
-        self.key_windows
-            .values_mut()
-            .flat_map(move |window| window.events(watermark_date_time))
-            .map(move |(_, events)| (key.clone(), events))
+        // windows have expired and can be returned.
+        self.key_windows.iter_mut().flat_map(move |(key, window)| {
+            window
+                .events(watermark_date_time)
+                .map(|(window, events)| (key.clone(), window, events))
+        })
     }
 }
 
@@ -1415,5 +1423,112 @@ mod tests {
         assert!(windows.events.is_empty());
         assert!(windows.start_date_time_windows.is_empty());
         assert!(windows.end_date_time_windows.is_empty());
+    }
+
+    struct NonAssigner;
+
+    impl<V> WindowAssigner<V> for NonAssigner {
+        type Iterator = std::iter::Empty<Window>;
+        fn assign(&self, event: &Event<V>) -> Self::Iterator {
+            std::iter::empty()
+        }
+    }
+
+    struct NonMerger;
+
+    impl WindowMerger for NonMerger {
+        fn merge<'a>(
+            &'a self,
+            windows: impl Iterator<Item = &'a Window>,
+        ) -> Box<[(Box<[Window]>, Window)]> {
+            Box::new([])
+        }
+    }
+
+    #[test]
+    fn windows_processor_empty() {
+        let mut processor = WindowsProcessor {
+            key_windows: HashMap::default(),
+            key_selector: |event: &Event<usize>| event.value,
+            assigner: NonAssigner,
+            merger: NonMerger,
+        };
+
+        assert!(processor
+            .process(new_event(0_usize, 12, 10))
+            .next()
+            .is_none());
+    }
+
+    struct FixedAssigner {
+        window: Window,
+    }
+
+    impl<V> WindowAssigner<V> for FixedAssigner {
+        type Iterator = std::iter::Once<Window>;
+        fn assign(&self, event: &Event<V>) -> Self::Iterator {
+            std::iter::once(self.window.clone())
+        }
+    }
+
+    #[test]
+    fn window_processor_different_key_expiry() {
+        let window = Window {
+            start_date_time: naive_date_time(12, 10),
+            end_date_time: naive_date_time(12, 20),
+        };
+        let mut processor = WindowsProcessor {
+            key_windows: HashMap::default(),
+            key_selector: |event: &Event<usize>| event.value,
+            assigner: FixedAssigner {
+                window: window.clone(),
+            },
+            merger: NonMerger,
+        };
+
+        assert!(processor
+            .process(new_event(0_usize, 12, 10))
+            .next()
+            .is_none());
+
+        assert!(processor
+            .process(new_event(1_usize, 12, 11))
+            .next()
+            .is_none());
+
+        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
+            processor.process(new_event(2_usize, 12, 30)).collect();
+
+        assert_eq!(3, key_events.len());
+
+        let key_event = key_events
+            .iter()
+            .filter(|(key, _, _)| *key == 0)
+            .next()
+            .unwrap();
+        assert_eq!(0_usize, key_event.0);
+        assert_eq!(window, key_event.1);
+        assert_eq!(1, key_event.2.len());
+        assert_eq!(new_event(0_usize, 12, 10), key_event.2[0]);
+
+        let key_event = key_events
+            .iter()
+            .filter(|(key, _, _)| *key == 1)
+            .next()
+            .unwrap();
+        assert_eq!(1_usize, key_event.0);
+        assert_eq!(window, key_event.1);
+        assert_eq!(1, key_event.2.len());
+        assert_eq!(new_event(1_usize, 12, 11), key_event.2[0]);
+
+        // No events in the window because the event is outside the window.
+        let key_event = key_events
+            .iter()
+            .filter(|(key, _, _)| *key == 2)
+            .next()
+            .unwrap();
+        assert_eq!(2_usize, key_event.0);
+        assert_eq!(window, key_event.1);
+        assert_eq!(0, key_event.2.len());
     }
 }
