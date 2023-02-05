@@ -526,9 +526,16 @@ impl<V> Windows<V> {
     where
         V: Clone,
     {
-        self.end_date_time_windows
-            .range(..=watermark_date_time)
-            .flat_map(|(_, windows)| windows)
+        let mut expired_end_date_time_windows = std::mem::take(&mut self.end_date_time_windows);
+
+        let split_date_time = watermark_date_time + Duration::nanoseconds(1);
+        let end_date_time_windows = expired_end_date_time_windows.split_off(&split_date_time);
+
+        std::mem::replace(&mut self.end_date_time_windows, end_date_time_windows);
+
+        expired_end_date_time_windows
+            .into_values()
+            .flatten()
             .map(|window| {
                 // Collect the window events.
                 let events: Box<[Event<V>]> = self
@@ -538,30 +545,26 @@ impl<V> Windows<V> {
                     .cloned()
                     .collect();
 
-                // Take the opportunity to remove expired data from the
-                // start_date_time_windows structure.
+                // Take the opportunity to remove expired data from the other
+                // members of Windows.
                 let start_date_time_windows = self
                     .start_date_time_windows
                     .get_mut(&window.start_date_time)
                     .unwrap();
-                start_date_time_windows.remove(window);
+                start_date_time_windows.remove(&window);
                 if start_date_time_windows.is_empty() {
                     self.start_date_time_windows.remove(&window.start_date_time);
                 }
 
+                // Remove all events that are older than the start of the first
+                // window.
+                if let Some(first_date_time) = self.start_date_time_windows.keys().next() {
+                    let events = self.events.split_off(first_date_time);
+                    std::mem::replace(&mut self.events, events);
+                }
+
                 (window.clone(), events)
             })
-    }
-
-    /// Remove expired end_date_time_windows and events.
-    fn evict(&mut self, watermark_date_time: NaiveDateTime) {
-        let split_date_time = watermark_date_time + Duration::nanoseconds(1);
-
-        // Make sure we don't keep windows that have end_date_time values on
-        // watermark_date_time as they are also done.
-        self.end_date_time_windows = self.end_date_time_windows.split_off(&split_date_time);
-
-        self.events = self.events.split_off(&watermark_date_time);
     }
 }
 
@@ -706,9 +709,6 @@ where
 
             process(key, events, global_state, key_state, sender).await;
         }
-
-        // Remove done end_date_time_windows.
-        windows_lock.evict(watermark_date_time);
     }
 
     pub fn process_state<O, FN, F, GST, KSTF, KST>(
@@ -1336,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_window_events() {
+    fn windows_multiple_events() {
         let mut windows = Windows::default();
         windows.add_window(&Window {
             start_date_time: naive_date_time(12, 0),
@@ -1364,7 +1364,6 @@ mod tests {
         for (window, events) in windows.events(watermark_date_time) {
             window_events_vec.push((window, events));
         }
-        windows.evict(watermark_date_time);
 
         assert_eq!(1, window_events_vec.len());
         assert_eq!(
@@ -1395,7 +1394,6 @@ mod tests {
         for (window, events) in windows.events(watermark_date_time) {
             window_events_vec.push((window, events));
         }
-        windows.evict(watermark_date_time);
 
         assert_eq!(0, window_events_vec.len());
 
@@ -1405,7 +1403,6 @@ mod tests {
         for (window, events) in windows.events(watermark_date_time) {
             window_events_vec.push((window, events));
         }
-        windows.evict(watermark_date_time);
 
         assert_eq!(1, window_events_vec.len());
         assert_eq!(
@@ -1423,6 +1420,53 @@ mod tests {
         assert!(windows.events.is_empty());
         assert!(windows.start_date_time_windows.is_empty());
         assert!(windows.end_date_time_windows.is_empty());
+    }
+
+    #[test]
+    fn windows_events() {
+        let mut windows = Windows::default();
+        windows.add_window(&Window {
+            start_date_time: naive_date_time(12, 0),
+            end_date_time: naive_date_time(12, 2),
+        });
+        windows.add_window(&Window {
+            start_date_time: naive_date_time(12, 10),
+            end_date_time: naive_date_time(12, 20),
+        });
+        [
+            new_event(0_usize, 12, 8),
+            new_event(1_usize, 12, 10),
+            new_event(2_usize, 12, 10),
+            new_event(3_usize, 12, 12),
+        ]
+        .into_iter()
+        .for_each(|event| {
+            windows.add_event(event);
+        });
+
+        let (window, events) = windows.events(naive_date_time(12, 10)).next().unwrap();
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 0),
+                end_date_time: naive_date_time(12, 2),
+            },
+            window
+        );
+        assert!(events.is_empty());
+
+        let (window, events) = windows.events(naive_date_time(12, 20)).next().unwrap();
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 10),
+                end_date_time: naive_date_time(12, 20),
+            },
+            window
+        );
+
+        assert_eq!(3, events.len());
+        assert_eq!(new_event(1_usize, 12, 10), events[0]);
+        assert_eq!(new_event(2_usize, 12, 10), events[1]);
+        assert_eq!(new_event(3_usize, 12, 12), events[2]);
     }
 
     struct NonAssigner;
