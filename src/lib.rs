@@ -526,12 +526,11 @@ impl<V> Windows<V> {
     where
         V: Clone,
     {
-        let mut expired_end_date_time_windows = std::mem::take(&mut self.end_date_time_windows);
-
         let split_date_time = watermark_date_time + Duration::nanoseconds(1);
-        let end_date_time_windows = expired_end_date_time_windows.split_off(&split_date_time);
+        let end_date_time_windows = self.end_date_time_windows.split_off(&split_date_time);
 
-        std::mem::replace(&mut self.end_date_time_windows, end_date_time_windows);
+        let expired_end_date_time_windows =
+            std::mem::replace(&mut self.end_date_time_windows, end_date_time_windows);
 
         expired_end_date_time_windows
             .into_values()
@@ -559,8 +558,7 @@ impl<V> Windows<V> {
                 // Remove all events that are older than the start of the first
                 // window.
                 if let Some(first_date_time) = self.start_date_time_windows.keys().next() {
-                    let events = self.events.split_off(first_date_time);
-                    std::mem::replace(&mut self.events, events);
+                    self.events = self.events.split_off(first_date_time);
                 }
 
                 (window.clone(), events)
