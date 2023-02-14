@@ -758,6 +758,78 @@ where
     }
 }
 
+pub struct WindowedDataStream2<V, KS, K, A, M>
+where
+    KS: Fn(&Event<V>) -> K,
+    K: Hash + Eq + Send + Clone + 'static,
+{
+    data_stream: DataStream<V>,
+    windows_processor: WindowsProcessor<K, KS, V, A, M>,
+}
+
+impl<V, KS, K, A, M> WindowedDataStream2<V, KS, K, A, M>
+where
+    V: Clone + Send + Sync + 'static,
+    KS: Fn(&Event<V>) -> K + Send + Sync + 'static,
+    K: Hash + Eq + Send + Sync + Clone + 'static,
+    A: WindowAssigner<V> + Send + Sync + 'static,
+    M: WindowMerger + Send + Sync + 'static,
+{
+    pub fn process<O, FN, F>(self, process: FN) -> DataStream<O>
+    where
+        O: Send + 'static,
+        FN: Fn(K, Box<[Event<V>]>, Sender<O>) -> F + Send + Sync + 'static,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.process_state(
+            move |key, events, _, _, sender: Sender<O>| process(key, events, sender),
+            (),
+            |_| (),
+        )
+    }
+
+    pub fn process_state<O, FN, F, GST, KSTF, KST>(
+        self,
+        process: FN,
+        global_state: GST,
+        key_state_fn: KSTF,
+    ) -> DataStream<O>
+    where
+        O: Send + 'static,
+        FN: Fn(K, Box<[Event<V>]>, GST, KST, Sender<O>) -> F + Send + Sync + 'static,
+        F: Future<Output = ()> + Send + 'static,
+        GST: Clone + Send + Sync + 'static,
+        KSTF: Fn(&K) -> KST + Send + Sync + 'static,
+        KST: Clone + Send + Sync + 'static,
+    {
+        let (sender, receiver) = channel::<Event<O>>(1);
+
+        self.data_stream.nodes.borrow_mut().spawn(async move {
+            let mut key_states: HashMap<K, KST> = HashMap::default();
+
+            let mut receiver = self.data_stream.receiver;
+            let mut windows_processor = self.windows_processor;
+            while let Some(event) = receiver.recv().await {
+                for (key, window, events) in windows_processor.process(event) {
+                    let key_state = key_states
+                        .entry(key.clone())
+                        .or_insert_with_key(&key_state_fn);
+                    let sender = Sender {
+                        sender: sender.clone(),
+                    };
+
+                    process(key, events, global_state.clone(), key_state.clone(), sender).await;
+                }
+            }
+        });
+
+        DataStream {
+            nodes: Rc::clone(&self.data_stream.nodes),
+            receiver,
+        }
+    }
+}
+
 pub struct Environment {
     nodes: Rc<RefCell<JoinSet<()>>>,
 }
