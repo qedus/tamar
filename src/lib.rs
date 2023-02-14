@@ -615,8 +615,8 @@ where
 
         // Iterate over all windows with the specified timestamp to see if any
         // windows have expired and can be returned.
-        self.key_windows.iter_mut().flat_map(move |(key, window)| {
-            window
+        self.key_windows.iter_mut().flat_map(move |(key, windows)| {
+            windows
                 .events(watermark_date_time)
                 .map(|(window, events)| (key.clone(), window, events))
         })
@@ -1514,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn window_processor_different_key_expiry() {
+    fn windows_processor_different_key_expiry() {
         let window = Window {
             start_date_time: naive_date_time(12, 10),
             end_date_time: naive_date_time(12, 20),
