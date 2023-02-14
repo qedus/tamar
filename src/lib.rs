@@ -570,8 +570,8 @@ struct WindowsProcessor<K, KS, V, A, M> {
     key_windows: HashMap<K, Windows<V>>,
 
     key_selector: KS,
-    assigner: A,
-    merger: M,
+    assigner: Arc<A>,
+    merger: Arc<M>,
 }
 
 impl<K, KS, V, A, M> WindowsProcessor<K, KS, V, A, M>
@@ -582,6 +582,15 @@ where
     A: WindowAssigner<V>,
     M: WindowMerger,
 {
+    fn new(key_selector: KS, assigner: A, merger: M) -> Self {
+        Self {
+            key_windows: Default::default(),
+            key_selector,
+            assigner: Arc::new(assigner),
+            merger: Arc::new(merger),
+        }
+    }
+
     fn process(
         &mut self,
         event: Event<V>,
@@ -1561,12 +1570,8 @@ mod tests {
 
     #[test]
     fn windows_processor_empty() {
-        let mut processor = WindowsProcessor {
-            key_windows: HashMap::default(),
-            key_selector: |event: &Event<usize>| event.value,
-            assigner: NonAssigner,
-            merger: NonMerger,
-        };
+        let mut processor =
+            WindowsProcessor::new(|event: &Event<usize>| event.value, NonAssigner, NonMerger);
 
         assert!(processor
             .process(new_event(0_usize, 12, 10))
@@ -1591,14 +1596,13 @@ mod tests {
             start_date_time: naive_date_time(12, 10),
             end_date_time: naive_date_time(12, 20),
         };
-        let mut processor = WindowsProcessor {
-            key_windows: HashMap::default(),
-            key_selector: |event: &Event<usize>| event.value,
-            assigner: FixedAssigner {
+        let mut processor = WindowsProcessor::new(
+            |event: &Event<usize>| event.value,
+            FixedAssigner {
                 window: window.clone(),
             },
-            merger: NonMerger,
-        };
+            NonMerger,
+        );
 
         assert!(processor
             .process(new_event(0_usize, 12, 10))
