@@ -226,7 +226,7 @@ where
 
 impl<V, KS, K> KeyedDataStream<V, KS, K>
 where
-    V: Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
     KS: Fn(&Event<V>) -> K + Send + 'static,
     K: Hash + Eq + Send + Clone + 'static,
 {
@@ -329,12 +329,21 @@ where
         }
     }
 
-    pub fn window<P>(self, processor: P) -> WindowedDataStream<V, KS, K, P, P> {
+    pub fn window<P>(self, processor: P) -> WindowedDataStream<V, KS, K, P, P>
+    where
+        P: WindowAssigner<V> + WindowMerger,
+    {
+        let data_stream = self.data_stream;
+        let key_selector = self.selector;
         let processor = Arc::new(processor);
         WindowedDataStream {
-            keyed_data_stream: self,
-            assigner: Arc::clone(&processor),
-            merger: Arc::clone(&processor),
+            data_stream: data_stream,
+            windows_processor: WindowsProcessor {
+                key_windows: Default::default(),
+                key_selector,
+                assigner: Arc::clone(&processor),
+                merger: Arc::clone(&processor),
+            },
         }
     }
 }
@@ -643,140 +652,11 @@ where
     KS: Fn(&Event<V>) -> K,
     K: Hash + Eq + Send + Clone + 'static,
 {
-    keyed_data_stream: KeyedDataStream<V, KS, K>,
-    assigner: Arc<A>,
-    merger: Arc<M>,
-}
-
-impl<V, KS, K, A, M> WindowedDataStream<V, KS, K, A, M>
-where
-    V: Clone + Send + Sync + 'static,
-    KS: Fn(&Event<V>) -> K + Send + 'static,
-    K: Hash + Eq + Send + Sync + Clone + 'static,
-    A: WindowAssigner<V> + Send + Sync + 'static,
-    M: WindowMerger + Send + Sync + 'static,
-{
-    pub fn process<O, FN, F>(self, process: FN) -> DataStream<O>
-    where
-        O: Send + 'static,
-        FN: Fn(K, Box<[Event<V>]>, Sender<O>) -> F + Send + Sync + 'static,
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.process_state(
-            move |key, events, _, _, sender: Sender<O>| process(key, events, sender),
-            (),
-            |_| (),
-        )
-    }
-
-    async fn process_windows<O, FN, F, GST, KST>(
-        windows: Arc<Mutex<Windows<V>>>,
-        assigner: Arc<A>,
-        merger: Arc<M>,
-        process: Arc<FN>,
-        key: K,
-        event: Event<V>,
-        global_state: GST,
-        key_state: KST,
-        sender: Sender<O>,
-    ) where
-        FN: Fn(K, Box<[Event<V>]>, GST, KST, Sender<O>) -> F + Send + Sync + 'static,
-        F: Future<Output = ()> + Send + 'static,
-        GST: Clone + Send + Sync + 'static,
-        KST: Clone + Send + Sync + 'static,
-        O: Send + 'static,
-    {
-        let mut windows_lock = windows.lock().await;
-        let watermark_date_time = event.watermark_date_time.unwrap();
-
-        assigner
-            .assign(&event)
-            .for_each(|ref window| windows_lock.add_window(window));
-
-        windows_lock.add_event(event);
-
-        merger
-            .merge(windows_lock.windows())
-            .into_iter()
-            .flat_map(|(from_windows, to_window)| {
-                from_windows
-                    .into_iter()
-                    .map(move |from_window| (from_window, to_window))
-            })
-            .for_each(|(from_window, to_window)| {
-                windows_lock.replace(from_window, to_window);
-            });
-
-        for (_, events) in windows_lock.events(watermark_date_time) {
-            let key = key.clone();
-            let key_state = key_state.clone();
-            let global_state = global_state.clone();
-            let process = Arc::clone(&process);
-            let sender = sender.clone();
-
-            process(key, events, global_state, key_state, sender).await;
-        }
-    }
-
-    pub fn process_state<O, FN, F, GST, KSTF, KST>(
-        self,
-        process: FN,
-        global_state: GST,
-        key_state_fn: KSTF,
-    ) -> DataStream<O>
-    where
-        O: Send + 'static,
-        FN: Fn(K, Box<[Event<V>]>, GST, KST, Sender<O>) -> F + Send + Sync + 'static,
-        F: Future<Output = ()> + Send + 'static,
-        GST: Clone + Send + Sync + 'static,
-        KSTF: Fn(&K) -> KST + Send + Sync + 'static,
-        KST: Clone + Send + Sync + 'static,
-    {
-        let process = Arc::new(process);
-        self.keyed_data_stream.process_state(
-            move |key,
-                  event,
-                  global_state,
-                  key_state: Arc<WindowedDataStreamKeyState<V, KST>>,
-                  sender| {
-                let assigner = Arc::clone(&self.assigner);
-                let merger = Arc::clone(&self.merger);
-                let process = Arc::clone(&process);
-
-                let windows = Arc::clone(&key_state.windows);
-                Self::process_windows(
-                    windows,
-                    assigner,
-                    merger,
-                    process,
-                    key,
-                    event,
-                    global_state,
-                    key_state.user_key_state.clone(),
-                    sender,
-                )
-            },
-            global_state,
-            move |key| {
-                Arc::new(WindowedDataStreamKeyState {
-                    user_key_state: key_state_fn(key),
-                    windows: Arc::new(Mutex::new(Windows::default())),
-                })
-            },
-        )
-    }
-}
-
-pub struct WindowedDataStream2<V, KS, K, A, M>
-where
-    KS: Fn(&Event<V>) -> K,
-    K: Hash + Eq + Send + Clone + 'static,
-{
     data_stream: DataStream<V>,
     windows_processor: WindowsProcessor<K, KS, V, A, M>,
 }
 
-impl<V, KS, K, A, M> WindowedDataStream2<V, KS, K, A, M>
+impl<V, KS, K, A, M> WindowedDataStream<V, KS, K, A, M>
 where
     V: Clone + Send + Sync + 'static,
     KS: Fn(&Event<V>) -> K + Send + Sync + 'static,
