@@ -566,8 +566,13 @@ impl<V> Windows<V> {
 
                 // Remove all events that are older than the start of the first
                 // window.
-                if let Some(first_date_time) = self.start_date_time_windows.keys().next() {
-                    self.events = self.events.split_off(first_date_time);
+                match self.start_date_time_windows.keys().next() {
+                    Some(first_date_time) => {
+                        self.events = self.events.split_off(first_date_time);
+                    }
+                    None => {
+                        self.events.clear();
+                    }
                 }
 
                 (window.clone(), events)
