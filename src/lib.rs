@@ -388,6 +388,11 @@ pub struct EventTimeSessionWindowProcessor {
 }
 
 impl EventTimeSessionWindowProcessor {
+    /// Constructs a new `EventTimeSessionWindowProcessor` with the specified
+    /// `timeout`.
+    ///
+    /// If a duration of `timeout` has passed between events then the window
+    /// trigger.
     pub fn with_timeout(timeout: Duration) -> Self {
         Self { timeout }
     }
@@ -644,12 +649,6 @@ where
                 .map(|(window, events)| (key.clone(), window, events))
         })
     }
-}
-
-struct WindowedDataStreamKeyState<V, KST> {
-    user_key_state: KST,
-
-    windows: Arc<Mutex<Windows<V>>>,
 }
 
 pub struct WindowedDataStream<V, KS, K, A, M>
@@ -1195,6 +1194,7 @@ mod tests {
                 new_event(0_usize, 12, 40),
                 new_event(1_usize, 12, 41),
                 new_event(1_usize, 12, 42),
+                new_event(2_usize, 13, 00),
             ]
             .into(),
         );
@@ -1431,6 +1431,58 @@ mod tests {
         assert_eq!(new_event(1_usize, 12, 10), events[0]);
         assert_eq!(new_event(2_usize, 12, 10), events[1]);
         assert_eq!(new_event(3_usize, 12, 12), events[2]);
+    }
+
+    #[test]
+    fn windows_contiguous() {
+        let mut windows = Windows::default();
+        windows.add_window(&Window {
+            start_date_time: naive_date_time(12, 10),
+            end_date_time: naive_date_time(12, 20),
+        });
+        windows.add_event(new_event(0_usize, 12, 10));
+
+        windows.add_window(&Window {
+            start_date_time: naive_date_time(12, 20),
+            end_date_time: naive_date_time(12, 30),
+        });
+        windows.add_event(new_event(0_usize, 12, 20));
+
+        {
+            let mut iter = windows.events(naive_date_time(12, 20));
+
+            let (window, events) = iter.next().unwrap();
+            assert_eq!(
+                Window {
+                    start_date_time: naive_date_time(12, 10),
+                    end_date_time: naive_date_time(12, 20),
+                },
+                window
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0], new_event(0_usize, 12, 10));
+
+            assert!(iter.next().is_none());
+        }
+
+        {
+            let mut iter = windows.events(naive_date_time(12, 30));
+
+            let (window, events) = iter.next().unwrap();
+            assert_eq!(
+                Window {
+                    start_date_time: naive_date_time(12, 20),
+                    end_date_time: naive_date_time(12, 30),
+                },
+                window
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0], new_event(0_usize, 12, 20));
+
+            assert!(iter.next().is_none());
+        }
+
+        assert!(windows.events(naive_date_time(12, 40)).next().is_none());
     }
 
     struct NonAssigner;
