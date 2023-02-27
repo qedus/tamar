@@ -448,6 +448,9 @@ impl WindowMerger for EventTimeSessionWindowProcessor {
 
         merged
             .into_iter()
+            // If the merged windows size is 1 then the window didn't get
+            // merged with anything else so filter it out.
+            .filter(|(merged_windows, _)| merged_windows.len() > 1)
             .map(|(merged_windows, window)| {
                 (
                     merged_windows
@@ -1030,21 +1033,7 @@ mod tests {
 
         let processor = EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10));
         let merged = processor.merge(windows.iter());
-        assert_eq!(2, merged.len());
-
-        let merge = merged
-            .iter()
-            .find(|(_from_windows, to_window)| to_window == &windows[0])
-            .unwrap();
-        assert_eq!(1, merge.0.len());
-        assert_eq!(windows[0], merge.0[0]);
-
-        let merge = merged
-            .iter()
-            .find(|(_from_windows, to_window)| to_window == &windows[1])
-            .unwrap();
-        assert_eq!(1, merge.0.len());
-        assert_eq!(windows[1], merge.0[0]);
+        assert_eq!(0, merged.len());
     }
 
     #[test]
