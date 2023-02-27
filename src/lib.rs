@@ -372,9 +372,7 @@ impl Window {
 }
 
 pub trait WindowAssigner<V> {
-    type Iterator: Iterator<Item = Window>;
-
-    fn assign(&self, event: &Event<V>) -> Self::Iterator;
+    fn assign(&self, event: &Event<V>) -> Box<[Window]>;
 }
 
 pub trait WindowMerger {
@@ -400,13 +398,11 @@ impl EventTimeSessionWindowProcessor {
 }
 
 impl<V> WindowAssigner<V> for EventTimeSessionWindowProcessor {
-    type Iterator = std::iter::Once<Window>;
-
-    fn assign(&self, event: &Event<V>) -> Self::Iterator {
-        std::iter::once(Window {
+    fn assign(&self, event: &Event<V>) -> Box<[Window]> {
+        Box::new([Window {
             start_date_time: event.event_date_time.unwrap(),
             end_date_time: event.event_date_time.unwrap() + self.timeout,
-        })
+        }])
     }
 }
 
@@ -627,6 +623,7 @@ where
         // the windows container for that event's key.
         self.assigner
             .assign(&event)
+            .into_iter()
             .for_each(|ref window| windows.add_window(window));
 
         windows.add_event(event);
@@ -1005,7 +1002,7 @@ mod tests {
         let processor = EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10));
 
         let event = new_event(0, 12, 10);
-        let windows: Box<[Window]> = processor.assign(&event).collect();
+        let windows = processor.assign(&event);
 
         assert_eq!(1, windows.len());
 
@@ -1490,9 +1487,8 @@ mod tests {
     struct NonAssigner;
 
     impl<V> WindowAssigner<V> for NonAssigner {
-        type Iterator = std::iter::Empty<Window>;
-        fn assign(&self, event: &Event<V>) -> Self::Iterator {
-            std::iter::empty()
+        fn assign(&self, event: &Event<V>) -> Box<[Window]> {
+            Box::new([])
         }
     }
 
@@ -1523,9 +1519,8 @@ mod tests {
     }
 
     impl<V> WindowAssigner<V> for FixedAssigner {
-        type Iterator = std::iter::Once<Window>;
-        fn assign(&self, event: &Event<V>) -> Self::Iterator {
-            std::iter::once(self.window.clone())
+        fn assign(&self, event: &Event<V>) -> Box<[Window]> {
+            Box::new([self.window.clone()])
         }
     }
 
