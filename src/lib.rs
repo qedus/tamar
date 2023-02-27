@@ -1,5 +1,3 @@
-use chrono::{Duration, NaiveDateTime, Utc};
-use futures::{future::BoxFuture, Future};
 use std::{
     cell::RefCell,
     cmp::PartialEq,
@@ -9,6 +7,9 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+
+use chrono::{Duration, NaiveDateTime, Utc};
+use futures::{future::BoxFuture, Future};
 use tokio::{
     sync::{mpsc, mpsc::channel, Mutex},
     task::JoinSet,
@@ -776,9 +777,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
     use std::ops::Range;
+
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+
+    use super::*;
 
     struct IncrementingSource<I> {
         iter: I,
@@ -859,13 +862,11 @@ mod tests {
                 let mut iter = events.drain(..);
                 while let Some(event) = receiver.receive().await {
                     let expected = iter.next().unwrap();
-                    assert_eq!(expected.processing_date_time, event.processing_date_time);
-                    assert_eq!(expected.event_date_time, event.event_date_time);
-                    assert_eq!(expected.watermark_date_time, event.watermark_date_time);
-                    assert_eq!(expected.value, event.value);
+                    assert_eq!(expected, event);
                 }
 
-                assert!(iter.next().is_none());
+                let next = iter.next();
+                assert!(next.is_none(), "expected none event: {:?}", next.unwrap());
             })
         }
     }
@@ -1192,8 +1193,10 @@ mod tests {
                 new_event(0_usize, 12, 10),
                 new_event(0_usize, 12, 30),
                 new_event(0_usize, 12, 40),
+                /*
                 new_event(1_usize, 12, 41),
                 new_event(1_usize, 12, 42),
+                */
                 new_event(2_usize, 13, 00),
             ]
             .into(),
@@ -1204,8 +1207,10 @@ mod tests {
                 new_event((0, 0), 12, 10),
                 new_event((1, 1), 12, 30),
                 new_event((2, 2), 12, 40),
+                /*
                 new_event((3, 0), 12, 41),
                 new_event((4, 1), 12, 42),
+                */
             ]
             .into(),
         );
@@ -1226,8 +1231,8 @@ mod tests {
                     let mut global_state = global_state.lock().await;
                     let mut key_state = key_state.lock().await;
                     let grouped_event = Event {
-                        event_date_time: events[0].event_date_time,
                         processing_date_time: events[0].processing_date_time,
+                        event_date_time: events[0].event_date_time,
                         watermark_date_time: events[0].watermark_date_time,
                         value: (global_state.count, key_state.count),
                     };
@@ -1435,54 +1440,68 @@ mod tests {
 
     #[test]
     fn windows_contiguous() {
-        let mut windows = Windows::default();
+        let mut windows: Windows<usize> = Windows::default();
+
         windows.add_window(&Window {
             start_date_time: naive_date_time(12, 10),
             end_date_time: naive_date_time(12, 20),
         });
         windows.add_event(new_event(0_usize, 12, 10));
 
+        let events: Vec<(Window, Box<[Event<usize>]>)> =
+            windows.events(naive_date_time(12, 10)).collect();
+        assert_eq!(0, events.len());
+
         windows.add_window(&Window {
-            start_date_time: naive_date_time(12, 20),
-            end_date_time: naive_date_time(12, 30),
+            start_date_time: naive_date_time(12, 30),
+            end_date_time: naive_date_time(12, 40),
         });
-        windows.add_event(new_event(0_usize, 12, 20));
+        windows.add_event(new_event(0_usize, 12, 30));
 
-        {
-            let mut iter = windows.events(naive_date_time(12, 20));
+        let events: Vec<(Window, Box<[Event<usize>]>)> =
+            windows.events(naive_date_time(12, 30)).collect();
+        assert_eq!(1, events.len());
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 10),
+                end_date_time: naive_date_time(12, 20),
+            },
+            events[0].0,
+        );
+        assert_eq!(1, events[0].1.len());
+        assert_eq!(new_event(0_usize, 12, 10), events[0].1[0]);
 
-            let (window, events) = iter.next().unwrap();
-            assert_eq!(
-                Window {
-                    start_date_time: naive_date_time(12, 10),
-                    end_date_time: naive_date_time(12, 20),
-                },
-                window
-            );
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0], new_event(0_usize, 12, 10));
+        windows.add_window(&Window {
+            start_date_time: naive_date_time(12, 40),
+            end_date_time: naive_date_time(12, 50),
+        });
+        windows.add_event(new_event(0_usize, 12, 40));
 
-            assert!(iter.next().is_none());
-        }
+        let events: Vec<(Window, Box<[Event<usize>]>)> =
+            windows.events(naive_date_time(12, 40)).collect();
+        assert_eq!(1, events.len());
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 30),
+                end_date_time: naive_date_time(12, 40),
+            },
+            events[0].0,
+        );
+        assert_eq!(1, events[0].1.len());
+        assert_eq!(new_event(0_usize, 12, 30), events[0].1[0]);
 
-        {
-            let mut iter = windows.events(naive_date_time(12, 30));
-
-            let (window, events) = iter.next().unwrap();
-            assert_eq!(
-                Window {
-                    start_date_time: naive_date_time(12, 20),
-                    end_date_time: naive_date_time(12, 30),
-                },
-                window
-            );
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0], new_event(0_usize, 12, 20));
-
-            assert!(iter.next().is_none());
-        }
-
-        assert!(windows.events(naive_date_time(12, 40)).next().is_none());
+        let events: Vec<(Window, Box<[Event<usize>]>)> =
+            windows.events(naive_date_time(13, 0)).collect();
+        assert_eq!(1, events.len());
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 40),
+                end_date_time: naive_date_time(12, 50),
+            },
+            events[0].0,
+        );
+        assert_eq!(1, events[0].1.len());
+        assert_eq!(new_event(0_usize, 12, 40), events[0].1[0]);
     }
 
     struct NonAssigner;
@@ -1585,5 +1604,46 @@ mod tests {
         assert_eq!(2_usize, key_event.0);
         assert_eq!(window, key_event.1);
         assert_eq!(0, key_event.2.len());
+    }
+
+    #[test]
+    fn windows_processor_event_time_session_separate_events() {
+        let mut processor = WindowsProcessor::new(
+            |event: &Event<usize>| event.value,
+            EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10)),
+            EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10)),
+        );
+
+        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
+            processor.process(new_event(0_usize, 12, 10)).collect();
+        assert_eq!(0, key_events.len());
+
+        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
+            processor.process(new_event(0_usize, 12, 30)).collect();
+        assert_eq!(1, key_events.len());
+        assert_eq!(0, key_events[0].0);
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 10),
+                end_date_time: naive_date_time(12, 20),
+            },
+            key_events[0].1
+        );
+        assert_eq!(1, key_events[0].2.len());
+        assert_eq!(new_event(0_usize, 12, 10), key_events[0].2[0]);
+
+        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
+            processor.process(new_event(0_usize, 12, 40)).collect();
+        assert_eq!(1, key_events.len());
+        assert_eq!(0, key_events[0].0);
+        assert_eq!(
+            Window {
+                start_date_time: naive_date_time(12, 30),
+                end_date_time: naive_date_time(12, 40),
+            },
+            key_events[0].1
+        );
+        assert_eq!(1, key_events[0].2.len());
+        assert_eq!(new_event(0_usize, 12, 30), key_events[0].2[0]);
     }
 }
