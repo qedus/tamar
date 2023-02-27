@@ -1193,24 +1193,18 @@ mod tests {
                 new_event(0_usize, 12, 10),
                 new_event(0_usize, 12, 30),
                 new_event(0_usize, 12, 40),
-                /*
-                new_event(1_usize, 12, 41),
-                new_event(1_usize, 12, 42),
-                */
-                new_event(2_usize, 13, 00),
+                new_event(1_usize, 12, 55),
+                new_event(1_usize, 12, 56),
+                new_event(2_usize, 13, 20),
             ]
             .into(),
         );
 
         let sink = SliceEventAssertSink(
             [
-                new_event((0, 0), 12, 10),
-                new_event((1, 1), 12, 30),
-                new_event((2, 2), 12, 40),
-                /*
-                new_event((3, 0), 12, 41),
-                new_event((4, 1), 12, 42),
-                */
+                new_event((0, 0, 0), 12, 10),
+                new_event((1, 1, 0), 12, 30),
+                new_event((2, 0, 1), 12, 55),
             ]
             .into(),
         );
@@ -1223,7 +1217,7 @@ mod tests {
                 Duration::minutes(10),
             ))
             .process_state(
-                |_key,
+                |key,
                  events,
                  global_state: Arc<Mutex<CountState>>,
                  key_state: Arc<Mutex<CountState>>,
@@ -1234,7 +1228,7 @@ mod tests {
                         processing_date_time: events[0].processing_date_time,
                         event_date_time: events[0].event_date_time,
                         watermark_date_time: events[0].watermark_date_time,
-                        value: (global_state.count, key_state.count),
+                        value: (global_state.count, key_state.count, key),
                     };
 
                     global_state.count += 1;
@@ -1634,16 +1628,21 @@ mod tests {
 
         let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
             processor.process(new_event(0_usize, 12, 40)).collect();
+        assert_eq!(0, key_events.len());
+
+        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
+            processor.process(new_event(0_usize, 13, 00)).collect();
         assert_eq!(1, key_events.len());
         assert_eq!(0, key_events[0].0);
         assert_eq!(
             Window {
                 start_date_time: naive_date_time(12, 30),
-                end_date_time: naive_date_time(12, 40),
+                end_date_time: naive_date_time(12, 50),
             },
             key_events[0].1
         );
-        assert_eq!(1, key_events[0].2.len());
+        assert_eq!(2, key_events[0].2.len());
         assert_eq!(new_event(0_usize, 12, 30), key_events[0].2[0]);
+        assert_eq!(new_event(0_usize, 12, 40), key_events[0].2[1]);
     }
 }
