@@ -338,7 +338,7 @@ where
         let key_selector = self.selector;
         let processor = Arc::new(processor);
         WindowedDataStream {
-            data_stream: data_stream,
+            data_stream,
             windows_processor: WindowsProcessor {
                 key_windows: Default::default(),
                 key_selector,
@@ -506,7 +506,7 @@ impl<V> Windows<V> {
             .start_date_time_windows
             .get_mut(&from_window.start_date_time)
             .unwrap();
-        start_windows.remove(&from_window);
+        start_windows.remove(from_window);
         if start_windows.is_empty() {
             self.start_date_time_windows
                 .remove(&from_window.start_date_time);
@@ -520,7 +520,7 @@ impl<V> Windows<V> {
             .end_date_time_windows
             .get_mut(&from_window.end_date_time)
             .unwrap();
-        end_windows.remove(&from_window);
+        end_windows.remove(from_window);
         if end_windows.is_empty() {
             self.end_date_time_windows
                 .remove(&from_window.end_date_time);
@@ -617,14 +617,14 @@ where
         let key = (self.key_selector)(&event);
         let watermark_date_time = event.watermark_date_time.unwrap();
 
-        let windows = self.key_windows.entry(key.clone()).or_default();
+        let windows = self.key_windows.entry(key).or_default();
 
         // Determine which windows the event is supposed to be in and add it to
         // the windows container for that event's key.
         self.assigner
             .assign(&event)
-            .into_iter()
-            .for_each(|ref window| windows.add_window(window));
+            .iter()
+            .for_each(|window| windows.add_window(window));
 
         windows.add_event(event);
 
@@ -632,10 +632,10 @@ where
         // windows can be merged.
         self.merger
             .merge(windows.windows())
-            .into_iter()
+            .iter()
             .flat_map(|(from_windows, to_window)| {
                 from_windows
-                    .into_iter()
+                    .iter()
                     .map(move |from_window| (from_window, to_window))
             })
             .for_each(|(from_window, to_window)| {
@@ -704,7 +704,7 @@ where
             let mut receiver = self.data_stream.receiver;
             let mut windows_processor = self.windows_processor;
             while let Some(event) = receiver.recv().await {
-                for (key, window, events) in windows_processor.process(event) {
+                for (key, _window, events) in windows_processor.process(event) {
                     let key_state = key_states
                         .entry(key.clone())
                         .or_insert_with_key(&key_state_fn);
