@@ -1267,16 +1267,13 @@ mod tests {
     async fn windowed_process_joined_events() {
         let env = Environment::default();
 
-        let source = SliceEventSource(
-            [
-                new_event(0_usize, 12, 10),
-                new_event(0_usize, 12, 12),
-                new_event(1_usize, 12, 30),
-            ]
-            .into(),
-        );
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(0_usize, 12, 12),
+            new_event(1_usize, 12, 30),
+        ]);
 
-        let sink = SliceEventAssertSink([new_event(vec![0_usize, 0_usize], 12, 10)].into());
+        let sink = SliceEventAssertSink([new_event(vec![0_usize, 0_usize], 12, 10)]);
 
         let stream = env.add_source(source);
 
@@ -1307,26 +1304,20 @@ mod tests {
     async fn windowed_process_state_separate_events() {
         let env = Environment::default();
 
-        let source = SliceEventSource(
-            [
-                new_event(0_usize, 12, 10),
-                new_event(0_usize, 12, 30),
-                new_event(0_usize, 12, 40),
-                new_event(1_usize, 12, 55),
-                new_event(1_usize, 12, 56),
-                new_event(2_usize, 13, 20),
-            ]
-            .into(),
-        );
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(0_usize, 12, 30),
+            new_event(0_usize, 12, 40),
+            new_event(1_usize, 12, 55),
+            new_event(1_usize, 12, 56),
+            new_event(2_usize, 13, 20),
+        ]);
 
-        let sink = SliceEventAssertSink(
-            [
-                new_event((0, 0, 0), 12, 10),
-                new_event((1, 1, 0), 12, 30),
-                new_event((2, 0, 1), 12, 55),
-            ]
-            .into(),
-        );
+        let sink = SliceEventAssertSink([
+            new_event((0, 0, 0), 12, 10),
+            new_event((1, 1, 0), 12, 30),
+            new_event((2, 0, 1), 12, 55),
+        ]);
 
         let stream = env.add_source(source);
 
@@ -1367,20 +1358,16 @@ mod tests {
     async fn windowed_process_state_joined_events() {
         let env = Environment::default();
 
-        let source = SliceEventSource(
-            [
-                new_event(0_usize, 12, 10),
-                new_event(0_usize, 12, 12),
-                new_event(0_usize, 12, 13),
-                new_event(1_usize, 12, 41),
-                new_event(1_usize, 12, 42),
-                new_event(2_usize, 12, 53),
-            ]
-            .into(),
-        );
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(0_usize, 12, 12),
+            new_event(0_usize, 12, 13),
+            new_event(1_usize, 12, 41),
+            new_event(1_usize, 12, 42),
+            new_event(2_usize, 12, 53),
+        ]);
 
-        let sink =
-            SliceEventAssertSink([new_event((0, 0), 12, 10), new_event((1, 0), 12, 41)].into());
+        let sink = SliceEventAssertSink([new_event((0, 0), 12, 10), new_event((1, 0), 12, 41)]);
 
         let stream = env.add_source(source);
 
@@ -1440,16 +1427,13 @@ mod tests {
     async fn windowed_aggregate_joined_events() {
         let env = Environment::default();
 
-        let source = SliceEventSource(
-            [
-                new_event(0_usize, 12, 10),
-                new_event(0_usize, 12, 12),
-                new_event(1_usize, 12, 30),
-            ]
-            .into(),
-        );
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(0_usize, 12, 12),
+            new_event(1_usize, 12, 30),
+        ]);
 
-        let sink = SliceEventAssertSink([new_event(4_usize, 12, 12)].into());
+        let sink = SliceEventAssertSink([new_event(4_usize, 12, 12)]);
 
         let stream = env.add_source(source);
 
