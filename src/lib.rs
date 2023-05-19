@@ -1,9 +1,10 @@
 use std::{
     cell::RefCell,
     cmp::PartialEq,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     hash::Hash,
+    ops::{Add, Bound::Included},
     rc::Rc,
     sync::Arc,
 };
@@ -11,11 +12,11 @@ use std::{
 use chrono::{Duration, NaiveDateTime, Utc};
 use futures::{future::BoxFuture, Future};
 use tokio::{
-    sync::{mpsc, mpsc::channel, Mutex},
+    sync::{mpsc, mpsc::channel},
     task::JoinSet,
 };
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(PartialEq, Debug)]
 pub struct Event<V> {
     pub processing_date_time: NaiveDateTime,
     pub event_date_time: Option<NaiveDateTime>,
@@ -33,7 +34,7 @@ impl<V> Event<V> {
         }
     }
 
-    pub fn with_value<O>(self, value: O) -> Event<O> {
+    pub fn with_value<VO>(&self, value: VO) -> Event<VO> {
         Event {
             event_date_time: self.event_date_time,
             processing_date_time: self.processing_date_time,
@@ -45,14 +46,6 @@ impl<V> Event<V> {
 
 pub struct Sender<V> {
     sender: mpsc::Sender<Event<V>>,
-}
-
-impl<V> Clone for Sender<V> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-        }
-    }
 }
 
 impl<V> Sender<V> {
@@ -130,15 +123,15 @@ where
         self.nodes.borrow_mut().spawn(sink.run(receiver));
     }
 
-    pub fn map<O, FN, F>(self, map: FN) -> DataStream<O>
+    pub fn map<VO, FN, F>(self, map: FN) -> DataStream<VO>
     where
-        O: Send + 'static,
+        VO: Send + 'static,
         FN: Fn(Event<V>) -> F + Send + Sync + 'static,
-        F: Future<Output = Event<O>> + Send + 'static,
+        F: Future<Output = Event<VO>> + Send + 'static,
     {
         let map = Arc::new(map);
         self.process_state(
-            move |event, _, mut sender: Sender<O>| {
+            move |event, _global_state, mut sender: Sender<VO>| {
                 let map = Arc::clone(&map);
                 async move {
                     let event = map(event).await;
@@ -155,7 +148,7 @@ where
     {
         let filter = Arc::new(filter);
         self.process_state(
-            move |event, _, mut sender: Sender<V>| {
+            move |event, _global_state, mut sender: Sender<V>| {
                 let filter = Arc::clone(&filter);
                 async move {
                     if filter(&event).await {
@@ -167,26 +160,26 @@ where
         )
     }
 
-    fn process<O, FN, F>(self, process: FN) -> DataStream<O>
+    fn process<VO, FN, F>(self, process: FN) -> DataStream<VO>
     where
-        O: Send + 'static,
-        FN: Fn(Event<V>, Sender<O>) -> F + Send + Sync + 'static,
+        VO: Send + 'static,
+        FN: Fn(Event<V>, Sender<VO>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
         self.process_state(
-            move |event, _, sender: Sender<O>| process(event, sender),
+            move |event, _global_state, sender: Sender<VO>| process(event, sender),
             (),
         )
     }
 
-    pub fn process_state<O, FN, F, GST>(self, process: FN, global_state: GST) -> DataStream<O>
+    pub fn process_state<VO, FN, F, GST>(self, process: FN, global_state: GST) -> DataStream<VO>
     where
-        O: Send + 'static,
-        FN: Fn(Event<V>, GST, Sender<O>) -> F + Send + Sync + 'static,
+        VO: Send + 'static,
+        FN: Fn(Event<V>, GST, Sender<VO>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
         GST: Clone + Send + Sync + 'static,
     {
-        let (sender, receiver) = channel::<Event<O>>(1);
+        let (sender, receiver) = channel::<Event<VO>>(1);
 
         self.nodes.borrow_mut().spawn(async move {
             let mut receiver = self.receiver;
@@ -238,15 +231,15 @@ where
         self.data_stream.add_sink(sink);
     }
 
-    pub fn map<O, FN, F>(self, map: FN) -> DataStream<O>
+    pub fn map<VO, FN, F>(self, map: FN) -> DataStream<VO>
     where
-        O: Send + 'static,
+        VO: Send + 'static,
         FN: Fn(K, Event<V>) -> F + Send + Sync + 'static,
-        F: Future<Output = Event<O>> + Send + 'static,
+        F: Future<Output = Event<VO>> + Send + 'static,
     {
         let map = Arc::new(map);
         self.process_state(
-            move |key, event, _, _, mut sender: Sender<O>| {
+            move |key, event, _global_state, _key_state, mut sender: Sender<VO>| {
                 let map = Arc::clone(&map);
                 async move {
                     let event = map(key, event).await;
@@ -254,7 +247,7 @@ where
                 }
             },
             (),
-            |_| (),
+            |_key| (),
         )
     }
 
@@ -264,7 +257,7 @@ where
     {
         let filter = Arc::new(filter);
         self.process_state(
-            move |key, event, _, _, mut sender: Sender<V>| {
+            move |key, event, _global_state, _key_state, mut sender: Sender<V>| {
                 let filter = Arc::clone(&filter);
                 async move {
                     if filter(key, &event).await {
@@ -273,38 +266,40 @@ where
                 }
             },
             (),
-            |_| (),
+            |_key| (),
         )
     }
 
-    fn process<O, FN, F>(self, process: FN) -> DataStream<O>
+    fn process<VO, FN, F>(self, process: FN) -> DataStream<VO>
     where
-        O: Send + 'static,
-        FN: Fn(K, Event<V>, Sender<O>) -> F + Send + Sync + 'static,
+        VO: Send + 'static,
+        FN: Fn(K, Event<V>, Sender<VO>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
         self.process_state(
-            move |key, event, _, _, sender: Sender<O>| process(key, event, sender),
+            move |key, event, _global_state, _key_state, sender: Sender<VO>| {
+                process(key, event, sender)
+            },
             (),
-            |_| (),
+            |_key| (),
         )
     }
 
-    pub fn process_state<O, FN, F, GST, KSTF, KST>(
+    pub fn process_state<VO, FN, F, GST, KSTF, KST>(
         self,
         process: FN,
         global_state: GST,
         key_state_fn: KSTF,
-    ) -> DataStream<O>
+    ) -> DataStream<VO>
     where
-        O: Send + 'static,
-        FN: Fn(K, Event<V>, GST, KST, Sender<O>) -> F + Send + Sync + 'static,
+        VO: Send + 'static,
+        FN: Fn(K, Event<V>, GST, KST, Sender<VO>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
         GST: Clone + Send + Sync + 'static,
         KSTF: Fn(&K) -> KST + Send + Sync + 'static,
         KST: Clone + Send + Sync + 'static,
     {
-        let (sender, receiver) = channel::<Event<O>>(1);
+        let (sender, receiver) = channel::<Event<VO>>(1);
 
         self.data_stream.nodes.borrow_mut().spawn(async move {
             let mut key_states: HashMap<K, KST> = HashMap::default();
@@ -330,26 +325,18 @@ where
         }
     }
 
-    pub fn window<P>(self, processor: P) -> WindowedDataStream<V, KS, K, P, P>
-    where
-        P: WindowAssigner<V> + WindowMerger,
-    {
+    pub fn window<WF>(self, factory: WF) -> WindowedDataStream<V, KS, WF> {
         let data_stream = self.data_stream;
-        let key_selector = self.selector;
-        let processor = Arc::new(processor);
+        let selector = self.selector;
         WindowedDataStream {
             data_stream,
-            windows_processor: WindowsProcessor {
-                key_windows: Default::default(),
-                key_selector,
-                assigner: Arc::clone(&processor),
-                merger: Arc::clone(&processor),
-            },
+            selector,
+            factory,
         }
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, PartialEq)]
 pub struct Window {
     // Contains all events that are >= start_date_time.
     start_date_time: NaiveDateTime,
@@ -358,361 +345,473 @@ pub struct Window {
     end_date_time: NaiveDateTime,
 }
 
-impl Window {
-    fn intersects(&self, other: &Self) -> bool {
-        self.start_date_time <= other.end_date_time && self.end_date_time >= other.start_date_time
-    }
+type WindowEvents<V> = Box<[(Window, Box<[Event<V>]>)]>;
 
-    fn union(&self, other: &Self) -> Self {
+pub trait WindowProcessor<V> {
+    fn add_event<'a>(&mut self, event: Event<V>) -> BoxFuture<'a, ()>;
+    fn trigger<'a>(&mut self, watermark_date_time: NaiveDateTime)
+        -> BoxFuture<'a, WindowEvents<V>>;
+}
+
+pub trait WindowAggregator<VO> {
+    fn add_event<'a, VI, ACC>(&mut self, accumulator: &ACC, event: Event<VI>) -> BoxFuture<'a, ()>
+    where
+        ACC: Fn(VI) -> VO,
+        VO: Add<Output = VO>;
+    fn trigger<'a>(
+        &mut self,
+        watermark_date_time: NaiveDateTime,
+    ) -> BoxFuture<'a, WindowEvents<VO>>;
+}
+
+pub trait WindowFactory {
+    type Processor<V>: WindowProcessor<V>
+    where
+        V: Send + 'static;
+    type Aggregator<V>: WindowAggregator<V>
+    where
+        V: Send + 'static;
+
+    fn processor<V>(&self) -> Self::Processor<V>
+    where
+        V: Send + 'static;
+    fn aggregator<V>(&self) -> Self::Aggregator<V>
+    where
+        V: Send + 'static;
+}
+
+struct EventTimeWindowMemoryStore<V> {
+    timeout: Duration,
+
+    // Key is the event_date_time of the event.
+    events: BTreeMap<NaiveDateTime, Vec<Event<V>>>,
+
+    // Key is the end_date_time of the window and value is the start_date_time.
+    windows: BTreeMap<NaiveDateTime, NaiveDateTime>,
+}
+
+impl<V> EventTimeWindowMemoryStore<V> {
+    fn with_timeout(timeout: Duration) -> Self {
         Self {
-            start_date_time: self.start_date_time.min(other.start_date_time),
-            end_date_time: self.end_date_time.max(other.end_date_time),
+            timeout,
+            events: Default::default(),
+            windows: Default::default(),
         }
     }
-}
 
-pub trait WindowAssigner<V> {
-    fn assign(&self, event: &Event<V>) -> Box<[Window]>;
-}
+    fn add_event(&mut self, event: Event<V>) -> Window {
+        let event_date_time = event.event_date_time.unwrap();
+        self.events.entry(event_date_time).or_default().push(event);
 
-pub trait WindowMerger {
-    fn merge<'a>(
-        &'a self,
-        windows: impl Iterator<Item = &'a Window>,
-    ) -> Box<[(Box<[Window]>, Window)]>;
-}
+        let mut windows_iter = self
+            .windows
+            .range((event_date_time - self.timeout)..)
+            .map(|(end_date_time, start_date_time)| Window {
+                end_date_time: *end_date_time,
+                start_date_time: *start_date_time,
+            })
+            .fuse();
+        let first_window = windows_iter.next();
+        let second_window = windows_iter.next();
 
-pub struct EventTimeSessionWindowProcessor {
-    timeout: Duration,
-}
+        // Are there any windows to possibly join with?
+        if first_window.is_none() {
+            // Create a window that is the smallest possible size to contain the event. We
+            // can't have a window that starts and ends on event_date_time as we have
+            // defined a window >= start_date_time and < end_date_time.
+            let window = Window {
+                start_date_time: event_date_time,
+                end_date_time: event_date_time + Duration::nanoseconds(1),
+            };
+            self.windows
+                .insert(window.end_date_time, window.start_date_time);
+            return window;
+        }
 
-impl EventTimeSessionWindowProcessor {
-    /// Constructs a new `EventTimeSessionWindowProcessor` with the specified
-    /// `timeout`.
-    ///
-    /// If a duration of `timeout` has passed between events then the window
-    /// trigger.
-    pub fn with_timeout(timeout: Duration) -> Self {
-        Self { timeout }
+        let first_window = first_window.unwrap();
+
+        // Is the first window before the event?
+        // We know it is going to be within the timeout period due to the range
+        // query above.
+        if first_window.end_date_time < event_date_time {
+            self.windows.remove(&first_window.end_date_time);
+
+            // If there are no other windows to merge then expand the first
+            // window to fit.
+            if second_window.is_none() {
+                let window = Window {
+                    start_date_time: first_window.start_date_time,
+                    end_date_time: event_date_time + Duration::nanoseconds(1),
+                };
+                self.windows
+                    .insert(window.end_date_time, window.start_date_time);
+                return window;
+            }
+
+            let second_window = second_window.unwrap();
+
+            // Is the second window outside our timeout?
+            if second_window.start_date_time > event_date_time + self.timeout {
+                let window = Window {
+                    start_date_time: first_window.start_date_time,
+                    end_date_time: event_date_time + Duration::nanoseconds(1),
+                };
+                self.windows
+                    .insert(window.end_date_time, window.start_date_time);
+                return window;
+            }
+
+            // Merge the first and second windows.
+            self.windows.remove(&second_window.end_date_time);
+            self.windows
+                .insert(second_window.end_date_time, first_window.start_date_time);
+            return Window {
+                start_date_time: first_window.start_date_time,
+                end_date_time: second_window.end_date_time,
+            };
+        }
+
+        // Does the first window overlap the event?
+        if first_window.end_date_time > event_date_time
+            && first_window.start_date_time <= event_date_time
+        {
+            // Just use the same window.
+            return Window {
+                start_date_time: first_window.start_date_time,
+                end_date_time: first_window.end_date_time,
+            };
+        }
+
+        // Is the first window too far in the future?
+        if first_window.start_date_time > event_date_time + self.timeout {
+            let window = Window {
+                start_date_time: event_date_time,
+                end_date_time: event_date_time + Duration::nanoseconds(1),
+            };
+            self.windows
+                .insert(window.end_date_time, window.start_date_time);
+            return window;
+        }
+
+        self.windows
+            .insert(first_window.end_date_time, event_date_time);
+        Window {
+            start_date_time: event_date_time,
+            end_date_time: first_window.end_date_time,
+        }
     }
-}
 
-impl<V> WindowAssigner<V> for EventTimeSessionWindowProcessor {
-    fn assign(&self, event: &Event<V>) -> Box<[Window]> {
-        Box::new([Window {
-            start_date_time: event.event_date_time.unwrap(),
-            end_date_time: event.event_date_time.unwrap() + self.timeout,
-        }])
-    }
-}
+    /// Triggers windows to be returned, if any are available. The trigger is
+    /// contingent on the following assumptions:
+    /// - The trigger gets called for all events, not just those in the same key.
+    /// - The watermark is always a fixed offset from event times.
+    fn trigger(&mut self, watermark_date_time: NaiveDateTime) -> WindowEvents<V> {
+        let windows = self
+            .windows
+            .split_off(&(watermark_date_time - self.timeout));
+        let triggered_windows: Vec<Window> = std::mem::replace(&mut self.windows, windows)
+            .into_iter()
+            .map(|(end_date_time, start_date_time)| Window {
+                start_date_time,
+                end_date_time,
+            })
+            .collect();
 
-impl WindowMerger for EventTimeSessionWindowProcessor {
-    fn merge<'a>(
-        &'a self,
-        windows: impl Iterator<Item = &'a Window>,
-    ) -> Box<[(Box<[Window]>, Window)]> {
-        let mut merged = Vec::default();
-        let mut current_merge: Option<(HashSet<Window>, Window)> = None;
+        if triggered_windows.is_empty() {
+            return Box::new([]);
+        }
 
-        for window in windows {
-            match current_merge {
-                None => {
-                    let mut merged_windows = HashSet::default();
-                    merged_windows.insert(window.clone());
-                    current_merge = Some((merged_windows, window.clone()));
+        let events = self.events.split_off(&(watermark_date_time - self.timeout));
+        let mut triggered_events = std::mem::replace(&mut self.events, events)
+            .into_values()
+            .flatten();
+
+        let mut triggered_sessions: Vec<Vec<Event<V>>> = Vec::new();
+
+        for window in &triggered_windows {
+            for event in triggered_events.by_ref() {
+                if triggered_sessions.is_empty() {
+                    triggered_sessions.push(vec![event]);
+                    continue;
                 }
-                Some(ref mut merge) => {
-                    if merge.1.intersects(window) {
-                        merge.1 = merge.1.union(window);
-                        merge.0.insert(window.clone());
-                    } else {
-                        let mut merged_windows = HashSet::default();
-                        merged_windows.insert(window.clone());
-                        merged.push(
-                            current_merge
-                                .replace((merged_windows, window.clone()))
-                                .unwrap(),
-                        );
-                    }
+
+                if event.event_date_time.unwrap() > window.end_date_time {
+                    triggered_sessions.push(vec![event]);
+                    break;
                 }
+
+                triggered_sessions.last_mut().unwrap().push(event);
             }
         }
 
-        if let Some(merge) = current_merge {
-            merged.push(merge);
-        }
-
-        merged
+        triggered_windows
             .into_iter()
-            // If the merged windows size is 1 then the window didn't get
-            // merged with anything else so filter it out.
-            .filter(|(merged_windows, _)| merged_windows.len() > 1)
-            .map(|(merged_windows, window)| {
-                (
-                    merged_windows
-                        .into_iter()
-                        .collect::<Vec<Window>>()
-                        .into_boxed_slice(),
-                    window,
-                )
-            })
-            .collect::<Vec<(Box<[Window]>, Window)>>()
+            .zip(
+                triggered_sessions
+                    .into_iter()
+                    .map(|events| events.into_boxed_slice()),
+            )
+            .collect::<Vec<(Window, Box<[Event<V>]>)>>()
             .into_boxed_slice()
     }
 }
 
-struct Windows<V> {
-    events: BTreeMap<NaiveDateTime, Vec<Event<V>>>,
-    start_date_time_windows: BTreeMap<NaiveDateTime, HashSet<Window>>,
-    end_date_time_windows: BTreeMap<NaiveDateTime, HashSet<Window>>,
+struct EventTimeSessionWindowProcessor<V> {
+    store: EventTimeWindowMemoryStore<V>,
 }
 
-impl<V> Default for Windows<V> {
-    fn default() -> Self {
-        Self {
-            events: BTreeMap::default(),
-            start_date_time_windows: BTreeMap::default(),
-            end_date_time_windows: BTreeMap::default(),
-        }
-    }
-}
-
-impl<V> Windows<V> {
-    fn add_window(&mut self, window: &Window) {
-        self.start_date_time_windows
-            .entry(window.start_date_time)
-            .or_default()
-            .insert(window.clone());
-        self.end_date_time_windows
-            .entry(window.end_date_time)
-            .or_default()
-            .insert(window.clone());
-    }
-
-    fn add_event(&mut self, event: Event<V>) {
-        let event_date_time = event.event_date_time.unwrap();
-        self.events.entry(event_date_time).or_default().push(event);
-    }
-
-    fn windows(&self) -> impl Iterator<Item = &Window> {
-        self.start_date_time_windows.values().flatten()
-    }
-
-    /// Replaces from_window to to_windows and migrates all the interanl data
-    /// appropriately.
-    fn replace(&mut self, from_window: &Window, to_window: &Window) {
-        // Replace old windows with new merged ones.
-        let start_windows = self
-            .start_date_time_windows
-            .get_mut(&from_window.start_date_time)
-            .unwrap();
-        start_windows.remove(from_window);
-        if start_windows.is_empty() {
-            self.start_date_time_windows
-                .remove(&from_window.start_date_time);
-        }
-        self.start_date_time_windows
-            .entry(to_window.start_date_time)
-            .or_default()
-            .insert(to_window.clone());
-
-        let end_windows = self
-            .end_date_time_windows
-            .get_mut(&from_window.end_date_time)
-            .unwrap();
-        end_windows.remove(from_window);
-        if end_windows.is_empty() {
-            self.end_date_time_windows
-                .remove(&from_window.end_date_time);
-        }
-        self.end_date_time_windows
-            .entry(to_window.end_date_time)
-            .or_default()
-            .insert(to_window.clone());
-    }
-
-    /// Return all the events for all the windows that have expired due to the
-    /// new watermark_date_time.
-    fn events<'a>(
-        &'a mut self,
-        watermark_date_time: NaiveDateTime,
-    ) -> impl Iterator<Item = (Window, Box<[Event<V>]>)> + 'a
-    where
-        V: Clone,
-    {
-        let split_date_time = watermark_date_time + Duration::nanoseconds(1);
-        let end_date_time_windows = self.end_date_time_windows.split_off(&split_date_time);
-
-        let expired_end_date_time_windows =
-            std::mem::replace(&mut self.end_date_time_windows, end_date_time_windows);
-
-        expired_end_date_time_windows
-            .into_values()
-            .flatten()
-            .map(|window| {
-                // Collect the window events.
-                let events: Box<[Event<V>]> = self
-                    .events
-                    .range(window.start_date_time..window.end_date_time)
-                    .flat_map(|(_, events)| events)
-                    .cloned()
-                    .collect();
-
-                // Take the opportunity to remove expired data from the other
-                // members of Windows.
-                let start_date_time_windows = self
-                    .start_date_time_windows
-                    .get_mut(&window.start_date_time)
-                    .unwrap();
-                start_date_time_windows.remove(&window);
-                if start_date_time_windows.is_empty() {
-                    self.start_date_time_windows.remove(&window.start_date_time);
-                }
-
-                // Remove all events that are older than the start of the first
-                // window.
-                match self.start_date_time_windows.keys().next() {
-                    Some(first_date_time) => {
-                        self.events = self.events.split_off(first_date_time);
-                    }
-                    None => {
-                        self.events.clear();
-                    }
-                }
-
-                (window.clone(), events)
-            })
-    }
-}
-
-struct WindowsProcessor<K, KS, V, A, M> {
-    key_windows: HashMap<K, Windows<V>>,
-
-    key_selector: KS,
-    assigner: Arc<A>,
-    merger: Arc<M>,
-}
-
-impl<K, KS, V, A, M> WindowsProcessor<K, KS, V, A, M>
+impl<V> WindowProcessor<V> for EventTimeSessionWindowProcessor<V>
 where
-    K: Eq + Hash + Clone + 'static,
-    KS: Fn(&Event<V>) -> K,
-    V: Clone,
-    A: WindowAssigner<V>,
-    M: WindowMerger,
+    V: Send + 'static,
 {
-    fn new(key_selector: KS, assigner: A, merger: M) -> Self {
-        Self {
-            key_windows: Default::default(),
-            key_selector,
-            assigner: Arc::new(assigner),
-            merger: Arc::new(merger),
-        }
+    fn add_event<'a>(&mut self, event: Event<V>) -> BoxFuture<'a, ()> {
+        self.store.add_event(event);
+
+        // async not needed so return empty response.
+        Box::pin(async {})
     }
 
-    fn process(
+    fn trigger<'a>(
         &mut self,
-        event: Event<V>,
-    ) -> impl Iterator<Item = (K, Window, Box<[Event<V>]>)> + '_ {
-        let key = (self.key_selector)(&event);
-        let watermark_date_time = event.watermark_date_time.unwrap();
-
-        let windows = self.key_windows.entry(key).or_default();
-
-        // Determine which windows the event is supposed to be in and add it to
-        // the windows container for that event's key.
-        self.assigner
-            .assign(&event)
-            .iter()
-            .for_each(|window| windows.add_window(window));
-
-        windows.add_event(event);
-
-        // It is possible that a new window created by the event means that
-        // windows can be merged.
-        self.merger
-            .merge(windows.windows())
-            .iter()
-            .flat_map(|(from_windows, to_window)| {
-                from_windows
-                    .iter()
-                    .map(move |from_window| (from_window, to_window))
-            })
-            .for_each(|(from_window, to_window)| {
-                windows.replace(from_window, to_window);
-            });
-
-        // Iterate over all windows with the specified timestamp to see if any
-        // windows have expired and can be returned.
-        self.key_windows.iter_mut().flat_map(move |(key, windows)| {
-            windows
-                .events(watermark_date_time)
-                .map(|(window, events)| (key.clone(), window, events))
-        })
+        watermark_date_time: NaiveDateTime,
+    ) -> BoxFuture<'a, WindowEvents<V>> {
+        let window_events = self.store.trigger(watermark_date_time);
+        Box::pin(async move { window_events })
     }
 }
 
-pub struct WindowedDataStream<V, KS, K, A, M>
+fn event_reducer<V>(left: Event<V>, right: Event<V>) -> Event<V>
 where
-    KS: Fn(&Event<V>) -> K,
-    K: Hash + Eq + Send + Clone + 'static,
+    V: Add<Output = V>,
 {
-    data_stream: DataStream<V>,
-    windows_processor: WindowsProcessor<K, KS, V, A, M>,
+    let processing_date_time = left.processing_date_time.max(right.processing_date_time);
+    let event_date_time = left.event_date_time.max(right.event_date_time);
+    let watermark_date_time = left.watermark_date_time.max(right.watermark_date_time);
+    let value = left.value + right.value;
+
+    Event {
+        processing_date_time,
+        event_date_time,
+        watermark_date_time,
+        value,
+    }
 }
 
-impl<V, KS, K, A, M> WindowedDataStream<V, KS, K, A, M>
+struct EventTimeSessionWindowAggregator<VO> {
+    store: EventTimeWindowMemoryStore<VO>,
+}
+
+impl<VO> WindowAggregator<VO> for EventTimeSessionWindowAggregator<VO>
 where
-    V: Clone + Send + Sync + 'static,
-    KS: Fn(&Event<V>) -> K + Send + Sync + 'static,
-    K: Hash + Eq + Send + Sync + Clone + 'static,
-    A: WindowAssigner<V> + Send + Sync + 'static,
-    M: WindowMerger + Send + Sync + 'static,
+    VO: Send + 'static,
 {
-    pub fn process<O, FN, F>(self, process: FN) -> DataStream<O>
+    fn add_event<'a, VI, ACC>(&mut self, accumulator: &ACC, event: Event<VI>) -> BoxFuture<'a, ()>
     where
-        O: Send + 'static,
-        FN: Fn(K, Box<[Event<V>]>, Sender<O>) -> F + Send + Sync + 'static,
+        ACC: Fn(VI) -> VO,
+        VO: Add<Output = VO>,
+    {
+        let event_copy = event.with_value(());
+        let value = accumulator(event.value);
+        let event = event_copy.with_value(value);
+
+        let window = self.store.add_event(event);
+
+        let mut event_date_times = self
+            .store
+            .events
+            .range((
+                Included(window.start_date_time),
+                Included(window.end_date_time),
+            ))
+            .map(|(event_date_time, _event)| event_date_time)
+            .cloned()
+            .collect::<Vec<NaiveDateTime>>();
+
+        let mut events: Vec<Event<VO>> = Vec::with_capacity(event_date_times.len());
+        for event_date_time in event_date_times.drain(..) {
+            events.extend(self.store.events.remove(&event_date_time).unwrap());
+        }
+
+        if let Some(aggregated_event) = events.drain(..).reduce(event_reducer) {
+            self.store.add_event(aggregated_event);
+        }
+
+        // Async not needed so return empty response.
+        Box::pin(async {})
+    }
+
+    fn trigger<'a>(
+        &mut self,
+        watermark_date_time: NaiveDateTime,
+    ) -> BoxFuture<'a, WindowEvents<VO>> {
+        let window_events = self.store.trigger(watermark_date_time);
+        Box::pin(async move { window_events })
+    }
+}
+
+struct EventTimeSessionWindowFactory {
+    timeout: Duration,
+}
+
+impl EventTimeSessionWindowFactory {
+    fn with_timeout(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl WindowFactory for EventTimeSessionWindowFactory {
+    type Processor<V> = EventTimeSessionWindowProcessor<V> where V: Send + 'static;
+    type Aggregator<V> = EventTimeSessionWindowAggregator<V> where V: Send + 'static;
+
+    fn processor<V>(&self) -> Self::Processor<V>
+    where
+        V: Send + 'static,
+    {
+        Self::Processor {
+            store: EventTimeWindowMemoryStore::with_timeout(self.timeout),
+        }
+    }
+
+    fn aggregator<V>(&self) -> Self::Aggregator<V>
+    where
+        V: Send + 'static,
+    {
+        Self::Aggregator {
+            store: EventTimeWindowMemoryStore::with_timeout(self.timeout),
+        }
+    }
+}
+
+pub struct WindowedDataStream<VI, KS, WF> {
+    data_stream: DataStream<VI>,
+    selector: KS,
+    factory: WF,
+}
+
+impl<VI, KS, K, WF> WindowedDataStream<VI, KS, WF>
+where
+    VI: Clone + Send + Sync + 'static,
+    KS: Fn(&Event<VI>) -> K + Send + Sync + 'static,
+    K: Hash + Eq + Send + Sync + Clone + 'static,
+    WF: WindowFactory + Send + 'static,
+{
+    pub fn process<VO, FN, F>(self, process: FN) -> DataStream<VO>
+    where
+        VO: Send + 'static,
+        FN: Fn(K, Box<[Event<VI>]>, Sender<VO>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
+        WF::Processor<VI>: Send,
     {
         self.process_state(
-            move |key, events, _, _, sender: Sender<O>| process(key, events, sender),
+            move |key, events, _global_state, _key_state, sender: Sender<VO>| {
+                process(key, events, sender)
+            },
             (),
-            |_| (),
+            |_key| (),
         )
     }
 
-    pub fn process_state<O, FN, F, GST, KSTF, KST>(
+    pub fn process_state<VO, FN, F, GST, KSTF, KST>(
         self,
         process: FN,
         global_state: GST,
         key_state_fn: KSTF,
-    ) -> DataStream<O>
+    ) -> DataStream<VO>
     where
-        O: Send + 'static,
-        FN: Fn(K, Box<[Event<V>]>, GST, KST, Sender<O>) -> F + Send + Sync + 'static,
+        VO: Send + 'static,
+        FN: Fn(K, Box<[Event<VI>]>, GST, KST, Sender<VO>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
         GST: Clone + Send + Sync + 'static,
         KSTF: Fn(&K) -> KST + Send + Sync + 'static,
         KST: Clone + Send + Sync + 'static,
+        WF::Processor<VI>: Send,
     {
-        let (sender, receiver) = channel::<Event<O>>(1);
+        let (sender, receiver) = channel::<Event<VO>>(1);
 
         self.data_stream.nodes.borrow_mut().spawn(async move {
             let mut key_states: HashMap<K, KST> = HashMap::default();
+            let mut processors: HashMap<K, WF::Processor<VI>> = HashMap::default();
 
             let mut receiver = self.data_stream.receiver;
-            let mut windows_processor = self.windows_processor;
-            while let Some(event) = receiver.recv().await {
-                for (key, _window, events) in windows_processor.process(event) {
-                    let key_state = key_states
-                        .entry(key.clone())
-                        .or_insert_with_key(&key_state_fn);
-                    let sender = Sender {
-                        sender: sender.clone(),
-                    };
+            let selector = self.selector;
+            let factory = self.factory;
 
-                    process(key, events, global_state.clone(), key_state.clone(), sender).await;
+            while let Some(event) = receiver.recv().await {
+                let key = selector(&event);
+                let processor = processors.entry(key.clone()).or_insert(factory.processor());
+
+                let watermark_date_time = event.watermark_date_time.unwrap();
+                processor.add_event(event).await;
+
+                for (key, processor) in processors.iter_mut() {
+                    for (_window, events) in processor
+                        .trigger(watermark_date_time)
+                        .await
+                        .into_vec()
+                        .drain(..)
+                    {
+                        let key_state = key_states
+                            .entry(key.clone())
+                            .or_insert_with_key(&key_state_fn);
+                        let sender = Sender {
+                            sender: sender.clone(),
+                        };
+
+                        process(
+                            key.clone(),
+                            events,
+                            global_state.clone(),
+                            key_state.clone(),
+                            sender,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        DataStream {
+            nodes: Rc::clone(&self.data_stream.nodes),
+            receiver,
+        }
+    }
+
+    pub fn aggregate<VO, ACC>(self, accumulator: ACC) -> DataStream<VO>
+    where
+        VO: Add<Output = VO> + Send + 'static,
+        ACC: Fn(VI) -> VO + Send + Sync + 'static,
+        WF::Aggregator<VO>: Send,
+    {
+        let (sender, receiver) = channel::<Event<VO>>(1);
+
+        self.data_stream.nodes.borrow_mut().spawn(async move {
+            let mut aggregators: HashMap<K, WF::Aggregator<VO>> = HashMap::default();
+
+            let mut receiver = self.data_stream.receiver;
+            let selector = self.selector;
+            let factory = self.factory;
+
+            while let Some(event) = receiver.recv().await {
+                let key = selector(&event);
+                let aggregator = aggregators
+                    .entry(key.clone())
+                    .or_insert(factory.aggregator());
+
+                let watermark_date_time = event.watermark_date_time.unwrap();
+                aggregator.add_event::<VI, ACC>(&accumulator, event).await;
+
+                for aggregator in aggregators.values_mut() {
+                    let window_events = aggregator.trigger(watermark_date_time).await;
+                    for event in window_events
+                        .into_vec()
+                        .into_iter()
+                        .flat_map(|(_window, events)| events.into_vec())
+                    {
+                        if sender.send(event).await.is_err() {
+                            // Pipe closed so return.
+                            return;
+                        }
+                    }
                 }
             }
         });
@@ -781,6 +880,8 @@ mod tests {
 
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
+    use tokio::sync::Mutex;
+
     use super::*;
 
     struct IncrementingSource<I> {
@@ -801,32 +902,32 @@ mod tests {
         }
     }
 
-    struct SliceValueSource<'a, V>(&'a [V]);
+    struct SliceValueSource<V, const N: usize>([V; N]);
 
-    impl<'a, V> Source<V> for SliceValueSource<'a, V>
+    impl<V, const N: usize> Source<V> for SliceValueSource<V, N>
     where
-        V: Clone + Send + Sync + 'static,
+        V: Send + 'static,
     {
         fn run<'b>(self, mut sender: Sender<V>) -> BoxFuture<'b, ()> {
-            let mut values = self.0.to_vec();
+            let values = self.0;
             Box::pin(async move {
-                for event in values.drain(..).map(Event::new) {
+                for event in values.into_iter().map(Event::new) {
                     sender.send(event).await;
                 }
             })
         }
     }
 
-    struct SliceValueAssertSink<'a, V>(&'a [V]);
+    struct SliceValueAssertSink<V, const N: usize>([V; N]);
 
-    impl<'a, V> Sink<V> for SliceValueAssertSink<'a, V>
+    impl<V, const N: usize> Sink<V> for SliceValueAssertSink<V, N>
     where
-        V: Debug + Clone + Send + PartialEq + 'static,
+        V: Send + Debug + PartialEq + 'static,
     {
         fn run<'b>(self, mut receiver: Receiver<V>) -> BoxFuture<'b, ()> {
-            let mut values = self.0.to_vec();
+            let values = self.0;
             Box::pin(async move {
-                let mut iter = values.drain(..).into_iter();
+                let mut iter = values.into_iter();
                 while let Some(event) = receiver.receive().await {
                     assert_eq!(iter.next().unwrap(), event.value);
                 }
@@ -834,32 +935,33 @@ mod tests {
         }
     }
 
-    struct SliceEventSource<V>(Box<[Event<V>]>);
+    struct SliceEventSource<V, const N: usize>([Event<V>; N]);
 
-    impl<V> Source<V> for SliceEventSource<V>
+    impl<V, const N: usize> Source<V> for SliceEventSource<V, N>
     where
-        V: Clone + Send + Sync + 'static,
+        V: Send + 'static,
     {
         fn run<'b>(self, mut sender: Sender<V>) -> BoxFuture<'b, ()> {
-            let events = self.0.to_vec();
+            let events = self.0;
             Box::pin(async move {
-                for event in events.to_vec() {
+                for event in events.into_iter() {
                     sender.send(event).await;
                 }
             })
         }
     }
 
-    struct SliceEventAssertSink<V>(Box<[Event<V>]>);
+    struct SliceEventAssertSink<V, const N: usize>([Event<V>; N]);
 
-    impl<V> Sink<V> for SliceEventAssertSink<V>
+    impl<V, const N: usize> Sink<V> for SliceEventAssertSink<V, N>
     where
-        V: Debug + Clone + Send + PartialEq + 'static,
+        Event<V>: PartialEq,
+        V: Send + Debug + 'static,
     {
         fn run<'b>(self, mut receiver: Receiver<V>) -> BoxFuture<'b, ()> {
-            let mut events = self.0.to_vec();
+            let events = self.0;
             Box::pin(async move {
-                let mut iter = events.drain(..);
+                let mut iter = events.into_iter();
                 while let Some(event) = receiver.receive().await {
                     let expected = iter.next().unwrap();
                     assert_eq!(expected, event);
@@ -887,7 +989,7 @@ mod tests {
 
     impl<V> Sink<V> for IncrementingAssertSink<V>
     where
-        V: Debug + Send + std::cmp::PartialEq + 'static,
+        V: Debug + Send + PartialEq + 'static,
         Range<V>: Iterator<Item = V>,
     {
         fn run<'a>(mut self, mut receiver: Receiver<V>) -> BoxFuture<'a, ()> {
@@ -950,12 +1052,17 @@ mod tests {
         env.execute().await;
     }
 
+    #[derive(Clone)]
+    struct CountState {
+        count: usize,
+    }
+
     #[tokio::test]
     async fn keyed_process_state() {
         let env = Environment::default();
 
-        let source = SliceValueSource(&["a", "b", "a", "b"]);
-        let sink = SliceValueAssertSink(&[(0, 0), (1, 0), (2, 1), (3, 1)]);
+        let source = SliceValueSource(["a", "b", "a", "b"]);
+        let sink = SliceValueAssertSink([(0, 0), (1, 0), (2, 1), (3, 1)]);
 
         let stream = env.add_source(source);
 
@@ -998,77 +1105,104 @@ mod tests {
     }
 
     #[test]
-    fn event_time_session_window_processor_assigner() {
-        let processor = EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10));
+    fn event_time_session_window_memory_store() {
+        let mut store = EventTimeWindowMemoryStore::with_timeout(Duration::minutes(10));
 
-        let event = new_event(0, 12, 10);
-        let windows = processor.assign(&event);
+        let window_events = store.trigger(naive_date_time(09, 40));
+        assert_eq!(window_events.len(), 0);
 
-        assert_eq!(1, windows.len());
-
-        let window = &windows[0];
-
-        assert_eq!(window.start_date_time, event.event_date_time.unwrap());
+        let event = new_event(0, 09, 50);
+        let window = store.add_event(event);
         assert_eq!(
-            window.end_date_time,
-            event.event_date_time.unwrap() + Duration::minutes(10)
-        );
-    }
-
-    #[test]
-    fn event_time_session_window_processor_merger_not_mergeable() {
-        let windows = [
+            window,
             Window {
-                start_date_time: naive_date_time(0, 0),
-                end_date_time: naive_date_time(0, 2),
-            },
-            Window {
-                start_date_time: naive_date_time(1, 0),
-                end_date_time: naive_date_time(1, 2),
-            },
-        ];
-
-        let processor = EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10));
-        let merged = processor.merge(windows.iter());
-        assert_eq!(0, merged.len());
-    }
-
-    #[test]
-    fn event_time_session_window_processor_merger_mergeable() {
-        let windows = [
-            Window {
-                start_date_time: naive_date_time(0, 0),
-                end_date_time: naive_date_time(0, 8),
-            },
-            Window {
-                start_date_time: naive_date_time(0, 8),
-                end_date_time: naive_date_time(0, 12),
-            },
-        ];
-
-        let processor = EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10));
-        let merged = processor.merge(windows.iter());
-        assert_eq!(1, merged.len());
-
-        let (from_windows, to_window) = &merged[0];
-
-        assert_eq!(
-            to_window,
-            &Window {
-                start_date_time: naive_date_time(0, 0),
-                end_date_time: naive_date_time(0, 12),
+                start_date_time: naive_date_time(09, 50),
+                end_date_time: naive_date_time(09, 50) + Duration::nanoseconds(1),
             }
         );
+        let window_events = store.trigger(naive_date_time(09, 50));
+        assert_eq!(window_events.len(), 0);
 
-        assert_eq!(2, from_windows.len());
+        let event = new_event(0, 10, 00);
+        let window = store.add_event(event);
+        assert_eq!(
+            window,
+            Window {
+                start_date_time: naive_date_time(09, 50),
+                end_date_time: naive_date_time(10, 00) + Duration::nanoseconds(1),
+            }
+        );
+        let window_events = store.trigger(naive_date_time(10, 00));
+        assert_eq!(window_events.len(), 0);
 
-        assert!(from_windows.iter().any(|window| window == &windows[0]));
-        assert!(from_windows.iter().any(|window| window == &windows[1]));
+        let event = new_event(0, 10, 05);
+        let window = store.add_event(event);
+        assert_eq!(
+            window,
+            Window {
+                start_date_time: naive_date_time(09, 50),
+                end_date_time: naive_date_time(10, 05) + Duration::nanoseconds(1),
+            }
+        );
+        let window_events = store.trigger(naive_date_time(10, 05));
+        assert_eq!(window_events.len(), 0);
+
+        let event = new_event(0, 10, 25);
+        let window = store.add_event(event);
+        assert_eq!(
+            window,
+            Window {
+                start_date_time: naive_date_time(10, 25),
+                end_date_time: naive_date_time(10, 25) + Duration::nanoseconds(1),
+            }
+        );
+        let window_events = store.trigger(naive_date_time(10, 25));
+        assert_eq!(window_events.len(), 1);
+        let window = &window_events[0].0;
+        assert_eq!(
+            window,
+            &Window {
+                start_date_time: naive_date_time(09, 50),
+                end_date_time: naive_date_time(10, 05) + Duration::nanoseconds(1),
+            }
+        );
+        let events = &window_events[0].1;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], new_event(0, 09, 50));
+        assert_eq!(events[1], new_event(0, 10, 00));
+        assert_eq!(events[2], new_event(0, 10, 05));
     }
 
-    #[derive(Clone)]
-    struct CountState {
-        count: usize,
+    #[tokio::test]
+    async fn event_time_session_window_aggregator_trigger() {
+        let mut agg = EventTimeSessionWindowAggregator {
+            store: EventTimeWindowMemoryStore::with_timeout(Duration::minutes(10)),
+        };
+
+        let acc = |_event| 2;
+
+        let event = new_event("A", 10, 00);
+        agg.add_event(&acc, event).await;
+        let window_events = agg.trigger(naive_date_time(10, 00)).await;
+        assert_eq!(window_events.len(), 0);
+
+        let event = new_event("B", 10, 05);
+        agg.add_event(&acc, event).await;
+        let window_events = agg.trigger(naive_date_time(10, 05)).await;
+        assert_eq!(window_events.len(), 0);
+
+        let window_events = agg.trigger(naive_date_time(10, 20)).await;
+        assert_eq!(window_events.len(), 1);
+        assert_eq!(
+            window_events[0].0,
+            Window {
+                start_date_time: naive_date_time(10, 00),
+                end_date_time: naive_date_time(10, 05) + Duration::nanoseconds(1),
+            }
+        );
+        dbg!(&window_events);
+        assert_eq!(window_events[0].1.len(), 1);
+        assert_eq!(window_events[0].1[0], new_event(4, 10, 05));
     }
 
     #[tokio::test]
@@ -1102,14 +1236,13 @@ mod tests {
     async fn windowed_process_separate_events() {
         let env = Environment::default();
 
-        let source =
-            SliceEventSource([new_event(0_usize, 12, 10), new_event(1_usize, 12, 30)].into());
+        let source = SliceEventSource([new_event(0_usize, 12, 10), new_event(1_usize, 12, 30)]);
 
-        let sink = SliceEventAssertSink([new_event(vec![0_usize], 12, 10)].into());
+        let sink = SliceEventAssertSink([new_event(vec![0_usize], 12, 10)]);
 
         env.add_source(source)
             .key_by(|event| event.value)
-            .window(EventTimeSessionWindowProcessor::with_timeout(
+            .window(EventTimeSessionWindowFactory::with_timeout(
                 Duration::minutes(10),
             ))
             .process(|_key, events, mut sender| async move {
@@ -1149,7 +1282,7 @@ mod tests {
 
         stream
             .key_by(|event| event.value)
-            .window(EventTimeSessionWindowProcessor::with_timeout(
+            .window(EventTimeSessionWindowFactory::with_timeout(
                 Duration::minutes(10),
             ))
             .process(|_key, events, mut sender| async move {
@@ -1199,7 +1332,7 @@ mod tests {
 
         stream
             .key_by(|event| event.value)
-            .window(EventTimeSessionWindowProcessor::with_timeout(
+            .window(EventTimeSessionWindowFactory::with_timeout(
                 Duration::minutes(10),
             ))
             .process_state(
@@ -1253,7 +1386,7 @@ mod tests {
 
         stream
             .key_by(|event| event.value)
-            .window(EventTimeSessionWindowProcessor::with_timeout(
+            .window(EventTimeSessionWindowFactory::with_timeout(
                 Duration::minutes(10),
             ))
             .process_state(
@@ -1284,349 +1417,50 @@ mod tests {
         env.execute().await;
     }
 
-    #[test]
-    fn windows_multiple_events() {
-        let mut windows = Windows::default();
-        windows.add_window(&Window {
-            start_date_time: naive_date_time(12, 0),
-            end_date_time: naive_date_time(12, 2),
-        });
-        windows.add_window(&Window {
-            start_date_time: naive_date_time(12, 10),
-            end_date_time: naive_date_time(12, 20),
-        });
+    #[tokio::test]
+    async fn windowed_aggregate_separate_events() {
+        let env = Environment::default();
 
-        [
-            new_event(0_usize, 12, 8),
-            new_event(1_usize, 12, 10),
-            new_event(2_usize, 12, 10),
-            new_event(3_usize, 12, 12),
-        ]
-        .into_iter()
-        .for_each(|event| {
-            windows.add_event(event);
-        });
+        let source = SliceEventSource([new_event(0_usize, 12, 10), new_event(1_usize, 12, 30)]);
 
-        let watermark_date_time = naive_date_time(12, 9);
+        let sink = SliceEventAssertSink([new_event(0_usize, 12, 10)]);
 
-        let mut window_events_vec = Vec::new();
-        for (window, events) in windows.events(watermark_date_time) {
-            window_events_vec.push((window, events));
-        }
+        env.add_source(source)
+            .key_by(|event| event.value)
+            .window(EventTimeSessionWindowFactory::with_timeout(
+                Duration::minutes(10),
+            ))
+            .aggregate(|value| value)
+            .add_sink(sink);
 
-        assert_eq!(1, window_events_vec.len());
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 0),
-                end_date_time: naive_date_time(12, 2),
-            },
-            window_events_vec[0].0
-        );
-        assert!(window_events_vec[0].1.is_empty());
-        assert_eq!(2, windows.events.len());
-
-        assert_eq!(
-            3,
-            windows
-                .events
-                .values()
-                .map(|events| events)
-                .flatten()
-                .count()
-        );
-        assert_eq!(1, windows.start_date_time_windows.len());
-        assert_eq!(1, windows.end_date_time_windows.len());
-
-        let watermark_date_time = naive_date_time(12, 10);
-
-        let mut window_events_vec = Vec::new();
-        for (window, events) in windows.events(watermark_date_time) {
-            window_events_vec.push((window, events));
-        }
-
-        assert_eq!(0, window_events_vec.len());
-
-        let watermark_date_time = naive_date_time(12, 20);
-
-        let mut window_events_vec = Vec::new();
-        for (window, events) in windows.events(watermark_date_time) {
-            window_events_vec.push((window, events));
-        }
-
-        assert_eq!(1, window_events_vec.len());
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 10),
-                end_date_time: naive_date_time(12, 20),
-            },
-            window_events_vec[0].0,
-        );
-        assert_eq!(3, window_events_vec[0].1.len());
-        assert_eq!(new_event(1_usize, 12, 10), window_events_vec[0].1[0]);
-        assert_eq!(new_event(2_usize, 12, 10), window_events_vec[0].1[1]);
-        assert_eq!(new_event(3_usize, 12, 12), window_events_vec[0].1[2]);
-
-        assert!(windows.events.is_empty());
-        assert!(windows.start_date_time_windows.is_empty());
-        assert!(windows.end_date_time_windows.is_empty());
+        env.execute().await;
     }
 
-    #[test]
-    fn windows_events() {
-        let mut windows = Windows::default();
-        windows.add_window(&Window {
-            start_date_time: naive_date_time(12, 0),
-            end_date_time: naive_date_time(12, 2),
-        });
-        windows.add_window(&Window {
-            start_date_time: naive_date_time(12, 10),
-            end_date_time: naive_date_time(12, 20),
-        });
-        [
-            new_event(0_usize, 12, 8),
-            new_event(1_usize, 12, 10),
-            new_event(2_usize, 12, 10),
-            new_event(3_usize, 12, 12),
-        ]
-        .into_iter()
-        .for_each(|event| {
-            windows.add_event(event);
-        });
+    #[tokio::test]
+    async fn windowed_aggregate_joined_events() {
+        let env = Environment::default();
 
-        let (window, events) = windows.events(naive_date_time(12, 10)).next().unwrap();
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 0),
-                end_date_time: naive_date_time(12, 2),
-            },
-            window
-        );
-        assert!(events.is_empty());
-
-        let (window, events) = windows.events(naive_date_time(12, 20)).next().unwrap();
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 10),
-                end_date_time: naive_date_time(12, 20),
-            },
-            window
+        let source = SliceEventSource(
+            [
+                new_event(0_usize, 12, 10),
+                new_event(0_usize, 12, 12),
+                new_event(1_usize, 12, 30),
+            ]
+            .into(),
         );
 
-        assert_eq!(3, events.len());
-        assert_eq!(new_event(1_usize, 12, 10), events[0]);
-        assert_eq!(new_event(2_usize, 12, 10), events[1]);
-        assert_eq!(new_event(3_usize, 12, 12), events[2]);
-    }
+        let sink = SliceEventAssertSink([new_event(4_usize, 12, 12)].into());
 
-    #[test]
-    fn windows_contiguous() {
-        let mut windows: Windows<usize> = Windows::default();
+        let stream = env.add_source(source);
 
-        windows.add_window(&Window {
-            start_date_time: naive_date_time(12, 10),
-            end_date_time: naive_date_time(12, 20),
-        });
-        windows.add_event(new_event(0_usize, 12, 10));
+        stream
+            .key_by(|event| event.value)
+            .window(EventTimeSessionWindowFactory::with_timeout(
+                Duration::minutes(10),
+            ))
+            .aggregate(|_value| 2_usize)
+            .add_sink(sink);
 
-        let events: Vec<(Window, Box<[Event<usize>]>)> =
-            windows.events(naive_date_time(12, 10)).collect();
-        assert_eq!(0, events.len());
-
-        windows.add_window(&Window {
-            start_date_time: naive_date_time(12, 30),
-            end_date_time: naive_date_time(12, 40),
-        });
-        windows.add_event(new_event(0_usize, 12, 30));
-
-        let events: Vec<(Window, Box<[Event<usize>]>)> =
-            windows.events(naive_date_time(12, 30)).collect();
-        assert_eq!(1, events.len());
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 10),
-                end_date_time: naive_date_time(12, 20),
-            },
-            events[0].0,
-        );
-        assert_eq!(1, events[0].1.len());
-        assert_eq!(new_event(0_usize, 12, 10), events[0].1[0]);
-
-        windows.add_window(&Window {
-            start_date_time: naive_date_time(12, 40),
-            end_date_time: naive_date_time(12, 50),
-        });
-        windows.add_event(new_event(0_usize, 12, 40));
-
-        let events: Vec<(Window, Box<[Event<usize>]>)> =
-            windows.events(naive_date_time(12, 40)).collect();
-        assert_eq!(1, events.len());
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 30),
-                end_date_time: naive_date_time(12, 40),
-            },
-            events[0].0,
-        );
-        assert_eq!(1, events[0].1.len());
-        assert_eq!(new_event(0_usize, 12, 30), events[0].1[0]);
-
-        let events: Vec<(Window, Box<[Event<usize>]>)> =
-            windows.events(naive_date_time(13, 0)).collect();
-        assert_eq!(1, events.len());
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 40),
-                end_date_time: naive_date_time(12, 50),
-            },
-            events[0].0,
-        );
-        assert_eq!(1, events[0].1.len());
-        assert_eq!(new_event(0_usize, 12, 40), events[0].1[0]);
-    }
-
-    struct NonAssigner;
-
-    impl<V> WindowAssigner<V> for NonAssigner {
-        fn assign(&self, event: &Event<V>) -> Box<[Window]> {
-            Box::new([])
-        }
-    }
-
-    struct NonMerger;
-
-    impl WindowMerger for NonMerger {
-        fn merge<'a>(
-            &'a self,
-            windows: impl Iterator<Item = &'a Window>,
-        ) -> Box<[(Box<[Window]>, Window)]> {
-            Box::new([])
-        }
-    }
-
-    #[test]
-    fn windows_processor_empty() {
-        let mut processor =
-            WindowsProcessor::new(|event: &Event<usize>| event.value, NonAssigner, NonMerger);
-
-        assert!(processor
-            .process(new_event(0_usize, 12, 10))
-            .next()
-            .is_none());
-    }
-
-    struct FixedAssigner {
-        window: Window,
-    }
-
-    impl<V> WindowAssigner<V> for FixedAssigner {
-        fn assign(&self, event: &Event<V>) -> Box<[Window]> {
-            Box::new([self.window.clone()])
-        }
-    }
-
-    #[test]
-    fn windows_processor_different_key_expiry() {
-        let window = Window {
-            start_date_time: naive_date_time(12, 10),
-            end_date_time: naive_date_time(12, 20),
-        };
-        let mut processor = WindowsProcessor::new(
-            |event: &Event<usize>| event.value,
-            FixedAssigner {
-                window: window.clone(),
-            },
-            NonMerger,
-        );
-
-        assert!(processor
-            .process(new_event(0_usize, 12, 10))
-            .next()
-            .is_none());
-
-        assert!(processor
-            .process(new_event(1_usize, 12, 11))
-            .next()
-            .is_none());
-
-        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
-            processor.process(new_event(2_usize, 12, 30)).collect();
-
-        assert_eq!(3, key_events.len());
-
-        let key_event = key_events
-            .iter()
-            .filter(|(key, _, _)| *key == 0)
-            .next()
-            .unwrap();
-        assert_eq!(0_usize, key_event.0);
-        assert_eq!(window, key_event.1);
-        assert_eq!(1, key_event.2.len());
-        assert_eq!(new_event(0_usize, 12, 10), key_event.2[0]);
-
-        let key_event = key_events
-            .iter()
-            .filter(|(key, _, _)| *key == 1)
-            .next()
-            .unwrap();
-        assert_eq!(1_usize, key_event.0);
-        assert_eq!(window, key_event.1);
-        assert_eq!(1, key_event.2.len());
-        assert_eq!(new_event(1_usize, 12, 11), key_event.2[0]);
-
-        // No events in the window because the event is outside the window.
-        let key_event = key_events
-            .iter()
-            .filter(|(key, _, _)| *key == 2)
-            .next()
-            .unwrap();
-        assert_eq!(2_usize, key_event.0);
-        assert_eq!(window, key_event.1);
-        assert_eq!(0, key_event.2.len());
-    }
-
-    #[test]
-    fn windows_processor_event_time_session_separate_events() {
-        let mut processor = WindowsProcessor::new(
-            |event: &Event<usize>| event.value,
-            EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10)),
-            EventTimeSessionWindowProcessor::with_timeout(Duration::minutes(10)),
-        );
-
-        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
-            processor.process(new_event(0_usize, 12, 10)).collect();
-        assert_eq!(0, key_events.len());
-
-        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
-            processor.process(new_event(0_usize, 12, 30)).collect();
-        assert_eq!(1, key_events.len());
-        assert_eq!(0, key_events[0].0);
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 10),
-                end_date_time: naive_date_time(12, 20),
-            },
-            key_events[0].1
-        );
-        assert_eq!(1, key_events[0].2.len());
-        assert_eq!(new_event(0_usize, 12, 10), key_events[0].2[0]);
-
-        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
-            processor.process(new_event(0_usize, 12, 40)).collect();
-        assert_eq!(0, key_events.len());
-
-        let key_events: Vec<(usize, Window, Box<[Event<usize>]>)> =
-            processor.process(new_event(0_usize, 13, 00)).collect();
-        assert_eq!(1, key_events.len());
-        assert_eq!(0, key_events[0].0);
-        assert_eq!(
-            Window {
-                start_date_time: naive_date_time(12, 30),
-                end_date_time: naive_date_time(12, 50),
-            },
-            key_events[0].1
-        );
-        assert_eq!(2, key_events[0].2.len());
-        assert_eq!(new_event(0_usize, 12, 30), key_events[0].2[0]);
-        assert_eq!(new_event(0_usize, 12, 40), key_events[0].2[1]);
+        env.execute().await;
     }
 }
