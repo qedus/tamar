@@ -556,7 +556,7 @@ impl<V> EventTimeWindowMemoryStore<V> {
     }
 }
 
-struct EventTimeSessionWindowProcessor<V> {
+pub struct EventTimeSessionWindowProcessor<V> {
     store: EventTimeWindowMemoryStore<V>,
 }
 
@@ -597,7 +597,7 @@ where
     }
 }
 
-struct EventTimeSessionWindowAggregator<VO> {
+pub struct EventTimeSessionWindowAggregator<VO> {
     store: EventTimeWindowMemoryStore<VO>,
 }
 
@@ -649,12 +649,12 @@ where
     }
 }
 
-struct EventTimeSessionWindowFactory {
+pub struct EventTimeSessionWindowFactory {
     timeout: Duration,
 }
 
 impl EventTimeSessionWindowFactory {
-    fn with_timeout(timeout: Duration) -> Self {
+    pub fn with_timeout(timeout: Duration) -> Self {
         Self { timeout }
     }
 }
