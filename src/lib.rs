@@ -257,7 +257,7 @@ where
 
 impl<V, KS, K> KeyedDataStream<V, KS, K>
 where
-    V: Clone + Send + Sync + 'static,
+    V: Send + Sync + 'static,
     KS: Fn(&Event<V>) -> K + Send + 'static,
     K: Hash + Eq + Send + Clone + 'static,
 {
