@@ -249,7 +249,6 @@ where
 pub struct KeyedDataStream<V, KS, K>
 where
     KS: Fn(&Event<V>) -> K,
-    K: Hash + Eq + Send + Clone + 'static,
 {
     data_stream: DataStream<V>,
     selector: KS,
