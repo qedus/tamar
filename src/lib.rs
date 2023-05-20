@@ -221,13 +221,11 @@ where
         self.nodes.borrow_mut().spawn(async move {
             let mut receiver = self.receiver;
             while let Some(event) = receiver.recv().await {
-                let left_sender = left_sender.clone();
                 let left_event = event.clone();
-                let left_join_handle =
-                    tokio::spawn(async move { left_sender.send(left_event).await });
-                let right_sender = right_sender.clone();
-                let right_join_handle = tokio::spawn(async move { right_sender.send(event).await });
-                let (left_result, right_result) = join!(left_join_handle, right_join_handle);
+                let right_event = event;
+
+                let (left_result, right_result) =
+                    join!(left_sender.send(left_event), right_sender.send(right_event));
 
                 if left_result.is_err() || right_result.is_err() {
                     return;
