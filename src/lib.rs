@@ -214,18 +214,17 @@ impl<V> DataStream<V>
 where
     V: Send + Sync + Clone + 'static,
 {
-    pub fn split(self) -> (DataStream<V>, DataStream<V>) {
+    pub fn split(self) -> (Self, Self) {
         let (left_sender, left_receiver) = channel::<Event<V>>(1);
         let (right_sender, right_receiver) = channel::<Event<V>>(1);
 
         self.nodes.borrow_mut().spawn(async move {
             let mut receiver = self.receiver;
             while let Some(event) = receiver.recv().await {
-                let left_event = event.clone();
-                let right_event = event;
-
-                let (left_result, right_result) =
-                    join!(left_sender.send(left_event), right_sender.send(right_event));
+                let (left_result, right_result) = join!(
+                    left_sender.send(event.clone()),
+                    right_sender.send(event.clone())
+                );
 
                 if left_result.is_err() || right_result.is_err() {
                     return;
@@ -234,11 +233,11 @@ where
         });
 
         (
-            DataStream {
+            Self {
                 nodes: Rc::clone(&self.nodes),
                 receiver: left_receiver,
             },
-            DataStream {
+            Self {
                 nodes: Rc::clone(&self.nodes),
                 receiver: right_receiver,
             },
@@ -369,6 +368,27 @@ where
             selector,
             factory,
         }
+    }
+}
+
+impl<V, KS, K> KeyedDataStream<V, KS, K>
+where
+    V: Send + Sync + Clone + 'static,
+    KS: Fn(&Event<V>) -> K + Clone,
+{
+    pub fn split(self) -> (Self, Self) {
+        let (left_data_stream, right_data_stream) = self.data_stream.split();
+
+        (
+            Self {
+                data_stream: left_data_stream,
+                selector: self.selector.clone(),
+            },
+            Self {
+                data_stream: right_data_stream,
+                selector: self.selector.clone(),
+            },
+        )
     }
 }
 
@@ -1511,6 +1531,54 @@ mod tests {
             event.value == 1 || event.value == 3
         }
         right_stream.filter(right_filter).add_sink(right_sink);
+
+        env.execute().await;
+    }
+
+    #[tokio::test]
+    async fn split_keyed_data_stream() {
+        let env = Environment::default();
+
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(1_usize, 12, 12),
+            new_event(2_usize, 12, 30),
+            new_event(3_usize, 12, 32),
+        ]);
+        let stream = env.add_source(source).key_by(|event| -> String {
+            if event.value < 2 {
+                "a".into()
+            } else {
+                "b".into()
+            }
+        });
+
+        let (left_stream, right_stream) = stream.split();
+
+        let left_sink = SliceEventAssertSink([
+            new_event("a".into(), 12, 10),
+            new_event("a".into(), 12, 12),
+            new_event("b".into(), 12, 30),
+            new_event("b".into(), 12, 32),
+        ]);
+
+        async fn left_map(key: String, event: Event<usize>) -> Event<String> {
+            event.with_value(key)
+        }
+        left_stream.map(left_map).add_sink(left_sink);
+
+        let right_sink = SliceEventAssertSink([
+            new_event("az".into(), 12, 10),
+            new_event("az".into(), 12, 12),
+            new_event("bz".into(), 12, 30),
+            new_event("bz".into(), 12, 32),
+        ]);
+
+        async fn right_map(key: String, event: Event<usize>) -> Event<String> {
+            let value = format!("{}z", key);
+            event.with_value(value)
+        }
+        right_stream.map(right_map).add_sink(right_sink);
 
         env.execute().await;
     }
