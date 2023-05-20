@@ -12,11 +12,12 @@ use std::{
 use chrono::{Duration, NaiveDateTime, Utc};
 use futures::{future::BoxFuture, Future};
 use tokio::{
+    join,
     sync::{mpsc, mpsc::channel},
     task::JoinSet,
 };
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Event<V> {
     pub processing_date_time: NaiveDateTime,
     pub event_date_time: Option<NaiveDateTime>,
@@ -206,6 +207,44 @@ where
             data_stream: self,
             selector,
         }
+    }
+}
+
+impl<V> DataStream<V>
+where
+    V: Send + Sync + Clone + 'static,
+{
+    pub fn split(self) -> (DataStream<V>, DataStream<V>) {
+        let (left_sender, left_receiver) = channel::<Event<V>>(1);
+        let (right_sender, right_receiver) = channel::<Event<V>>(1);
+
+        self.nodes.borrow_mut().spawn(async move {
+            let mut receiver = self.receiver;
+            while let Some(event) = receiver.recv().await {
+                let left_sender = left_sender.clone();
+                let left_event = event.clone();
+                let left_join_handle =
+                    tokio::spawn(async move { left_sender.send(left_event).await });
+                let right_sender = right_sender.clone();
+                let right_join_handle = tokio::spawn(async move { right_sender.send(event).await });
+                let (left_result, right_result) = join!(left_join_handle, right_join_handle);
+
+                if left_result.is_err() || right_result.is_err() {
+                    return;
+                }
+            }
+        });
+
+        (
+            DataStream {
+                nodes: Rc::clone(&self.nodes),
+                receiver: left_receiver,
+            },
+            DataStream {
+                nodes: Rc::clone(&self.nodes),
+                receiver: right_receiver,
+            },
+        )
     }
 }
 
@@ -1444,6 +1483,37 @@ mod tests {
             ))
             .aggregate(|_value| 2_usize)
             .add_sink(sink);
+
+        env.execute().await;
+    }
+
+    #[tokio::test]
+    async fn split_data_stream() {
+        let env = Environment::default();
+
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(1_usize, 12, 12),
+            new_event(2_usize, 12, 30),
+            new_event(3_usize, 12, 32),
+        ]);
+        let stream = env.add_source(source);
+
+        let (left_stream, right_stream) = stream.split();
+
+        let left_sink =
+            SliceEventAssertSink([new_event(0_usize, 12, 10), new_event(2_usize, 12, 30)]);
+        async fn left_filter(event: &Event<usize>) -> bool {
+            event.value == 0 || event.value == 2
+        }
+        left_stream.filter(left_filter).add_sink(left_sink);
+
+        let right_sink =
+            SliceEventAssertSink([new_event(1_usize, 12, 12), new_event(3_usize, 12, 32)]);
+        async fn right_filter(event: &Event<usize>) -> bool {
+            event.value == 1 || event.value == 3
+        }
+        right_stream.filter(right_filter).add_sink(right_sink);
 
         env.execute().await;
     }
