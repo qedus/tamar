@@ -12,11 +12,12 @@ use std::{
 use chrono::{Duration, NaiveDateTime, Utc};
 use futures::{future::BoxFuture, Future};
 use tokio::{
+    join,
     sync::{mpsc, mpsc::channel},
     task::JoinSet,
 };
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Event<V> {
     pub processing_date_time: NaiveDateTime,
     pub event_date_time: Option<NaiveDateTime>,
@@ -209,10 +210,44 @@ where
     }
 }
 
+impl<V> DataStream<V>
+where
+    V: Send + Sync + Clone + 'static,
+{
+    pub fn split(self) -> (Self, Self) {
+        let (left_sender, left_receiver) = channel::<Event<V>>(1);
+        let (right_sender, right_receiver) = channel::<Event<V>>(1);
+
+        self.nodes.borrow_mut().spawn(async move {
+            let mut receiver = self.receiver;
+            while let Some(event) = receiver.recv().await {
+                let (left_result, right_result) = join!(
+                    left_sender.send(event.clone()),
+                    right_sender.send(event.clone())
+                );
+
+                if left_result.is_err() || right_result.is_err() {
+                    return;
+                }
+            }
+        });
+
+        (
+            Self {
+                nodes: Rc::clone(&self.nodes),
+                receiver: left_receiver,
+            },
+            Self {
+                nodes: Rc::clone(&self.nodes),
+                receiver: right_receiver,
+            },
+        )
+    }
+}
+
 pub struct KeyedDataStream<V, KS, K>
 where
     KS: Fn(&Event<V>) -> K,
-    K: Hash + Eq + Send + Clone + 'static,
 {
     data_stream: DataStream<V>,
     selector: KS,
@@ -220,7 +255,7 @@ where
 
 impl<V, KS, K> KeyedDataStream<V, KS, K>
 where
-    V: Clone + Send + Sync + 'static,
+    V: Send + Sync + 'static,
     KS: Fn(&Event<V>) -> K + Send + 'static,
     K: Hash + Eq + Send + Clone + 'static,
 {
@@ -333,6 +368,27 @@ where
             selector,
             factory,
         }
+    }
+}
+
+impl<V, KS, K> KeyedDataStream<V, KS, K>
+where
+    V: Send + Sync + Clone + 'static,
+    KS: Fn(&Event<V>) -> K + Clone,
+{
+    pub fn split(self) -> (Self, Self) {
+        let (left_data_stream, right_data_stream) = self.data_stream.split();
+
+        (
+            Self {
+                data_stream: left_data_stream,
+                selector: self.selector.clone(),
+            },
+            Self {
+                data_stream: right_data_stream,
+                selector: self.selector.clone(),
+            },
+        )
     }
 }
 
@@ -649,6 +705,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct EventTimeSessionWindowFactory {
     timeout: Duration,
 }
@@ -690,7 +747,7 @@ pub struct WindowedDataStream<VI, KS, WF> {
 
 impl<VI, KS, K, WF> WindowedDataStream<VI, KS, WF>
 where
-    VI: Clone + Send + Sync + 'static,
+    VI: Send + Sync + 'static,
     KS: Fn(&Event<VI>) -> K + Send + Sync + 'static,
     K: Hash + Eq + Send + Sync + Clone + 'static,
     WF: WindowFactory + Send + 'static,
@@ -820,6 +877,30 @@ where
             nodes: Rc::clone(&self.data_stream.nodes),
             receiver,
         }
+    }
+}
+
+impl<VI, KS, K, WF> WindowedDataStream<VI, KS, WF>
+where
+    VI: Send + Sync + Clone + 'static,
+    KS: Fn(&Event<VI>) -> K + Clone,
+    WF: Clone,
+{
+    pub fn split(self) -> (Self, Self) {
+        let (left_data_stream, right_data_stream) = self.data_stream.split();
+
+        (
+            Self {
+                data_stream: left_data_stream,
+                selector: self.selector.clone(),
+                factory: self.factory.clone(),
+            },
+            Self {
+                data_stream: right_data_stream,
+                selector: self.selector.clone(),
+                factory: self.factory.clone(),
+            },
+        )
     }
 }
 
@@ -1267,16 +1348,13 @@ mod tests {
     async fn windowed_process_joined_events() {
         let env = Environment::default();
 
-        let source = SliceEventSource(
-            [
-                new_event(0_usize, 12, 10),
-                new_event(0_usize, 12, 12),
-                new_event(1_usize, 12, 30),
-            ]
-            .into(),
-        );
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(0_usize, 12, 12),
+            new_event(1_usize, 12, 30),
+        ]);
 
-        let sink = SliceEventAssertSink([new_event(vec![0_usize, 0_usize], 12, 10)].into());
+        let sink = SliceEventAssertSink([new_event(vec![0_usize, 0_usize], 12, 10)]);
 
         let stream = env.add_source(source);
 
@@ -1307,26 +1385,20 @@ mod tests {
     async fn windowed_process_state_separate_events() {
         let env = Environment::default();
 
-        let source = SliceEventSource(
-            [
-                new_event(0_usize, 12, 10),
-                new_event(0_usize, 12, 30),
-                new_event(0_usize, 12, 40),
-                new_event(1_usize, 12, 55),
-                new_event(1_usize, 12, 56),
-                new_event(2_usize, 13, 20),
-            ]
-            .into(),
-        );
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(0_usize, 12, 30),
+            new_event(0_usize, 12, 40),
+            new_event(1_usize, 12, 55),
+            new_event(1_usize, 12, 56),
+            new_event(2_usize, 13, 20),
+        ]);
 
-        let sink = SliceEventAssertSink(
-            [
-                new_event((0, 0, 0), 12, 10),
-                new_event((1, 1, 0), 12, 30),
-                new_event((2, 0, 1), 12, 55),
-            ]
-            .into(),
-        );
+        let sink = SliceEventAssertSink([
+            new_event((0, 0, 0), 12, 10),
+            new_event((1, 1, 0), 12, 30),
+            new_event((2, 0, 1), 12, 55),
+        ]);
 
         let stream = env.add_source(source);
 
@@ -1367,20 +1439,16 @@ mod tests {
     async fn windowed_process_state_joined_events() {
         let env = Environment::default();
 
-        let source = SliceEventSource(
-            [
-                new_event(0_usize, 12, 10),
-                new_event(0_usize, 12, 12),
-                new_event(0_usize, 12, 13),
-                new_event(1_usize, 12, 41),
-                new_event(1_usize, 12, 42),
-                new_event(2_usize, 12, 53),
-            ]
-            .into(),
-        );
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(0_usize, 12, 12),
+            new_event(0_usize, 12, 13),
+            new_event(1_usize, 12, 41),
+            new_event(1_usize, 12, 42),
+            new_event(2_usize, 12, 53),
+        ]);
 
-        let sink =
-            SliceEventAssertSink([new_event((0, 0), 12, 10), new_event((1, 0), 12, 41)].into());
+        let sink = SliceEventAssertSink([new_event((0, 0), 12, 10), new_event((1, 0), 12, 41)]);
 
         let stream = env.add_source(source);
 
@@ -1440,16 +1508,13 @@ mod tests {
     async fn windowed_aggregate_joined_events() {
         let env = Environment::default();
 
-        let source = SliceEventSource(
-            [
-                new_event(0_usize, 12, 10),
-                new_event(0_usize, 12, 12),
-                new_event(1_usize, 12, 30),
-            ]
-            .into(),
-        );
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(0_usize, 12, 12),
+            new_event(1_usize, 12, 30),
+        ]);
 
-        let sink = SliceEventAssertSink([new_event(4_usize, 12, 12)].into());
+        let sink = SliceEventAssertSink([new_event(4_usize, 12, 12)]);
 
         let stream = env.add_source(source);
 
@@ -1460,6 +1525,121 @@ mod tests {
             ))
             .aggregate(|_value| 2_usize)
             .add_sink(sink);
+
+        env.execute().await;
+    }
+
+    #[tokio::test]
+    async fn split_data_stream() {
+        let env = Environment::default();
+
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(1_usize, 12, 12),
+            new_event(2_usize, 12, 30),
+            new_event(3_usize, 12, 32),
+        ]);
+        let stream = env.add_source(source);
+
+        let (left_stream, right_stream) = stream.split();
+
+        let left_sink =
+            SliceEventAssertSink([new_event(0_usize, 12, 10), new_event(2_usize, 12, 30)]);
+        async fn left_filter(event: &Event<usize>) -> bool {
+            event.value == 0 || event.value == 2
+        }
+        left_stream.filter(left_filter).add_sink(left_sink);
+
+        let right_sink =
+            SliceEventAssertSink([new_event(1_usize, 12, 12), new_event(3_usize, 12, 32)]);
+        async fn right_filter(event: &Event<usize>) -> bool {
+            event.value == 1 || event.value == 3
+        }
+        right_stream.filter(right_filter).add_sink(right_sink);
+
+        env.execute().await;
+    }
+
+    #[tokio::test]
+    async fn split_keyed_data_stream() {
+        let env = Environment::default();
+
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(1_usize, 12, 12),
+            new_event(2_usize, 12, 30),
+            new_event(3_usize, 12, 32),
+        ]);
+        let stream = env.add_source(source).key_by(|event| -> String {
+            if event.value < 2 {
+                "a".into()
+            } else {
+                "b".into()
+            }
+        });
+
+        let (left_stream, right_stream) = stream.split();
+
+        let left_sink = SliceEventAssertSink([
+            new_event("a".into(), 12, 10),
+            new_event("a".into(), 12, 12),
+            new_event("b".into(), 12, 30),
+            new_event("b".into(), 12, 32),
+        ]);
+
+        async fn left_map(key: String, event: Event<usize>) -> Event<String> {
+            event.with_value(key)
+        }
+        left_stream.map(left_map).add_sink(left_sink);
+
+        let right_sink = SliceEventAssertSink([
+            new_event("az".into(), 12, 10),
+            new_event("az".into(), 12, 12),
+            new_event("bz".into(), 12, 30),
+            new_event("bz".into(), 12, 32),
+        ]);
+
+        async fn right_map(key: String, event: Event<usize>) -> Event<String> {
+            let value = format!("{}z", key);
+            event.with_value(value)
+        }
+        right_stream.map(right_map).add_sink(right_sink);
+
+        env.execute().await;
+    }
+
+    #[tokio::test]
+    async fn split_windowed_data_stream() {
+        let env = Environment::default();
+
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(1_usize, 12, 12),
+            new_event(2_usize, 12, 30),
+            new_event(3_usize, 12, 32),
+        ]);
+        let stream = env
+            .add_source(source)
+            .key_by(|event| -> String {
+                if event.value < 2 {
+                    "a".into()
+                } else {
+                    "b".into()
+                }
+            })
+            .window(EventTimeSessionWindowFactory::with_timeout(
+                Duration::minutes(10),
+            ));
+
+        let (left_stream, right_stream) = stream.split();
+
+        let left_sink = SliceEventAssertSink([new_event(2, 12, 12)]);
+
+        left_stream.aggregate(|_value| 1).add_sink(left_sink);
+
+        let right_sink = SliceEventAssertSink([new_event(2, 12, 12)]);
+
+        right_stream.aggregate(|_value| 1).add_sink(right_sink);
 
         env.execute().await;
     }
