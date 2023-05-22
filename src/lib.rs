@@ -1632,7 +1632,6 @@ mod tests {
             ));
 
         let (left_stream, right_stream) = stream.split();
-        //let left_stream = stream;
 
         let left_sink = SliceEventAssertSink([new_event(2, 12, 12)]);
 
