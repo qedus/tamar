@@ -705,6 +705,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct EventTimeSessionWindowFactory {
     timeout: Duration,
 }
@@ -746,7 +747,7 @@ pub struct WindowedDataStream<VI, KS, WF> {
 
 impl<VI, KS, K, WF> WindowedDataStream<VI, KS, WF>
 where
-    VI: Clone + Send + Sync + 'static,
+    VI: Send + Sync + 'static,
     KS: Fn(&Event<VI>) -> K + Send + Sync + 'static,
     K: Hash + Eq + Send + Sync + Clone + 'static,
     WF: WindowFactory + Send + 'static,
@@ -876,6 +877,30 @@ where
             nodes: Rc::clone(&self.data_stream.nodes),
             receiver,
         }
+    }
+}
+
+impl<VI, KS, K, WF> WindowedDataStream<VI, KS, WF>
+where
+    VI: Send + Sync + Clone + 'static,
+    KS: Fn(&Event<VI>) -> K + Clone,
+    WF: Clone,
+{
+    pub fn split(self) -> (Self, Self) {
+        let (left_data_stream, right_data_stream) = self.data_stream.split();
+
+        (
+            Self {
+                data_stream: left_data_stream,
+                selector: self.selector.clone(),
+                factory: self.factory.clone(),
+            },
+            Self {
+                data_stream: right_data_stream,
+                selector: self.selector.clone(),
+                factory: self.factory.clone(),
+            },
+        )
     }
 }
 
@@ -1579,6 +1604,43 @@ mod tests {
             event.with_value(value)
         }
         right_stream.map(right_map).add_sink(right_sink);
+
+        env.execute().await;
+    }
+
+    #[tokio::test]
+    async fn split_windowed_data_stream() {
+        let env = Environment::default();
+
+        let source = SliceEventSource([
+            new_event(0_usize, 12, 10),
+            new_event(1_usize, 12, 12),
+            new_event(2_usize, 12, 30),
+            new_event(3_usize, 12, 32),
+        ]);
+        let stream = env
+            .add_source(source)
+            .key_by(|event| -> String {
+                if event.value < 2 {
+                    "a".into()
+                } else {
+                    "b".into()
+                }
+            })
+            .window(EventTimeSessionWindowFactory::with_timeout(
+                Duration::minutes(10),
+            ));
+
+        let (left_stream, right_stream) = stream.split();
+        //let left_stream = stream;
+
+        let left_sink = SliceEventAssertSink([new_event(2, 12, 12)]);
+
+        left_stream.aggregate(|_value| 1).add_sink(left_sink);
+
+        let right_sink = SliceEventAssertSink([new_event(2, 12, 12)]);
+
+        right_stream.aggregate(|_value| 1).add_sink(right_sink);
 
         env.execute().await;
     }
