@@ -161,7 +161,7 @@ where
         )
     }
 
-    fn process<VO, FN, F>(self, process: FN) -> DataStream<VO>
+    pub fn process<VO, FN, F>(self, process: FN) -> DataStream<VO>
     where
         VO: Send + 'static,
         FN: Fn(Event<V>, Sender<VO>) -> F + Send + Sync + 'static,
@@ -305,7 +305,7 @@ where
         )
     }
 
-    fn process<VO, FN, F>(self, process: FN) -> DataStream<VO>
+    pub fn process<VO, FN, F>(self, process: FN) -> DataStream<VO>
     where
         VO: Send + 'static,
         FN: Fn(K, Event<V>, Sender<VO>) -> F + Send + Sync + 'static,
